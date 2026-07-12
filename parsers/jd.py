@@ -1,5 +1,6 @@
 import re
 import html as html_lib
+import httpx
 
 from bs4 import BeautifulSoup
 
@@ -12,27 +13,17 @@ from utils.url_utils import normalize_image_url, dedupe_urls, get_url_ext
 
 class JDParser(BaseParser):
     """
-    京东商品解析器 - 详情边界识别版。
+    京东商品解析器。
 
     当前策略：
-
-    1. 主图：
-       根据 debug 文件，主图位于：
-       .image-carousel-track.vertical
-       只从该区域及明确主图缩略图区域提取。
-
-    2. SKU 图：
-       根据 debug 文件，SKU 图位于：
-       .specification-item-sku-image
-
+    1. 主图：从京东页面 DOM 中提取。
+    2. SKU 图：从规格区域中的 SKU 图片提取。
     3. 详情图：
-       使用页面视觉边界识别：
-       起点：
-           商品详情 / 商品介绍 / 图文详情
-       终点：
-           正品行货 / 权利声明 / 价格说明 / 售后保障 / 包装清单 / 推荐区域
-
-       只抓起点和终点之间的图片。
+       - 优先从 Playwright 捕获到的 pc_item_getWareGraphic 接口响应中提取；
+       - 传统详情接口作为兜底；
+       - 自动过滤错误页素材、资质证照、推荐商品、评论图片、UI 图标等；
+       - 自动清理 JSON/JSONP 转义 URL；
+       - 自动去重。
     """
 
     def __init__(self, log_callback=None):
@@ -49,29 +40,38 @@ class JDParser(BaseParser):
 
         platform, product_id = PlatformDetector.detect(url)
 
-        html, rendered_data = self.browser.open_page_and_eval(
+        html, rendered_data, network_texts = self.browser.open_page_and_eval(
             url,
             js_script=self._build_jd_collect_js(),
+            collect_network=True,
         )
 
-        soup = BeautifulSoup(html, "lxml")
+        try:
+            soup = BeautifulSoup(html, "lxml")
+        except Exception:
+            soup = BeautifulSoup(html, "html.parser")
 
         title = rendered_data.get("title") or self._parse_title_from_html(soup)
         title = self._clean_title(title)
 
         main_urls = rendered_data.get("main_images") or []
         sku_items = rendered_data.get("sku_images") or []
-        detail_urls = rendered_data.get("detail_images") or []
+        dom_detail_urls = rendered_data.get("detail_images") or []
+
+        api_detail_urls = self._fetch_jd_detail_images_from_api(product_id, url)
+        network_detail_urls = self._extract_detail_images_from_network_texts(network_texts)
+
+        detail_urls = dedupe_urls(dom_detail_urls + api_detail_urls + network_detail_urls)
 
         main_images = self._build_main_images(main_urls)
         sku_images = self._build_sku_images(sku_items)
         detail_images = self._build_detail_images(
             detail_urls,
-            source="jd_detail_boundary",
+            source="jd_detail_graphic",
         )
 
         if not detail_images:
-            self._log("京东页面未识别到准确详情图。可能该商品无图文详情，或详情图未暴露在当前页面 DOM。")
+            self._log("京东页面未识别到详情图。可能该商品无图文详情，或当前接口未返回有效图片。")
 
         self._log(f"京东商品标题：{title}")
         self._log(f"京东主图识别：{len(main_images)} 张")
@@ -90,7 +90,13 @@ class JDParser(BaseParser):
 
     def _build_jd_collect_js(self) -> str:
         """
-        京东页面 DOM 精准提取 JS。
+        京东页面 DOM 提取 JS。
+
+        负责：
+        1. 标题；
+        2. 主图；
+        3. SKU 图；
+        4. DOM 中已出现的详情图兜底。
         """
 
         return r"""
@@ -106,6 +112,10 @@ class JDParser(BaseParser):
                 if (!url) return "";
 
                 url = String(url).trim();
+
+                if (!url) return "";
+
+                url = url.replace(/\\\//g, "/");
 
                 if (url.startsWith("//")) {
                     url = "https:" + url;
@@ -130,7 +140,13 @@ class JDParser(BaseParser):
 
             const isJdImage = (url) => {
                 if (!url) return false;
-                return String(url).toLowerCase().includes("360buyimg.com");
+
+                const lower = String(url).toLowerCase();
+
+                return (
+                    lower.includes("360buyimg.com") ||
+                    lower.includes("jdimg.com")
+                );
             };
 
             const getImgUrl = (img) => {
@@ -143,39 +159,53 @@ class JDParser(BaseParser):
                     "data-lazyload",
                     "data-src",
                     "data-original",
+                    "data-img",
                     "src"
                 ];
 
                 for (const attr of attrs) {
                     const val = img.getAttribute(attr);
-                    if (val) return cleanUrl(val);
+
+                    if (val) {
+                        return cleanUrl(val);
+                    }
                 }
 
                 const srcset = img.getAttribute("srcset");
 
                 if (srcset) {
                     const first = srcset.split(",")[0].trim().split(" ")[0];
-                    if (first) return cleanUrl(first);
+
+                    if (first) {
+                        return cleanUrl(first);
+                    }
                 }
 
                 return "";
             };
 
-            const getBgUrl = (el) => {
-                if (!el) return "";
+            const getBgUrls = (el) => {
+                if (!el) return [];
 
-                const style = window.getComputedStyle(el);
-                const bg = style && style.backgroundImage ? style.backgroundImage : "";
+                const urls = [];
+                const styleAttr = el.getAttribute("style") || "";
+                const computedStyle = window.getComputedStyle(el);
+                const bg = computedStyle && computedStyle.backgroundImage ? computedStyle.backgroundImage : "";
 
-                if (!bg || bg === "none") return "";
+                [styleAttr, bg].forEach(text => {
+                    if (!text) return;
 
-                const match = bg.match(/url\(["']?(.*?)["']?\)/);
+                    const reg = /url\(["']?(.*?)["']?\)/g;
+                    let m;
 
-                if (match && match[1]) {
-                    return cleanUrl(match[1]);
-                }
+                    while ((m = reg.exec(text)) !== null) {
+                        if (m[1]) {
+                            urls.push(cleanUrl(m[1]));
+                        }
+                    }
+                });
 
-                return "";
+                return urls;
             };
 
             const addUnique = (arr, url) => {
@@ -234,16 +264,88 @@ class JDParser(BaseParser):
                     "try",
                     "trial",
                     "certificate",
-                    "qualification"
+                    "qualification",
+                    "license",
+                    "permit",
+                    "error-new"
                 ];
 
                 return badWords.some(w => text.includes(w));
             };
 
-            // ------------------------------------------------------------
-            // 1. 标题
-            // ------------------------------------------------------------
+            const isBadDetailUrl = (url) => {
+                if (!url) return true;
 
+                const lower = String(url).toLowerCase();
+
+                const badWords = [
+                    "logo",
+                    "icon",
+                    "sprite",
+                    "avatar",
+                    "qrcode",
+                    "qr-code",
+                    "shop",
+                    "store",
+                    "seller",
+                    "recommend",
+                    "comment",
+                    "evaluate",
+                    "service",
+                    "promise",
+                    "badge",
+                    "medal",
+                    "blank",
+                    "loading",
+                    "transparent",
+                    "arrow",
+                    "play",
+                    "pause",
+                    "video",
+                    "customer",
+                    "kefu",
+                    "consult",
+                    "dongdong",
+                    "smile",
+                    "face",
+                    "star",
+                    "rate",
+                    "score",
+                    "coupon",
+                    "gift",
+                    "imagetools",
+                    "shaidan",
+                    "default.image",
+                    "popshop",
+                    "elevator",
+                    "lachine",
+                    "calculator",
+                    "certificate",
+                    "certification",
+                    "qualification",
+                    "license",
+                    "licence",
+                    "permit",
+                    "businesslicense",
+                    "business-license",
+                    "aptitude",
+                    "recordal",
+                    "record",
+                    "beian",
+                    "icp",
+                    "yyzz",
+                    "wenwangwen",
+                    "error-new",
+                    "try_03",
+                    "try1_07",
+                    "yinying_06",
+                    "error_06"
+                ];
+
+                return badWords.some(word => lower.includes(word));
+            };
+
+            // 标题
             const titleSelectors = [
                 ".sku-title-name",
                 ".sku-name",
@@ -282,10 +384,7 @@ class JDParser(BaseParser):
                 result.title = document.title;
             }
 
-            // ------------------------------------------------------------
-            // 2. 主图
-            // ------------------------------------------------------------
-
+            // 主图
             const mainRoots = Array.from(
                 document.querySelectorAll(".image-carousel-track.vertical")
             );
@@ -328,10 +427,7 @@ class JDParser(BaseParser):
 
             result.main_images = result.main_images.slice(0, 12);
 
-            // ------------------------------------------------------------
-            // 3. SKU 图
-            // ------------------------------------------------------------
-
+            // SKU 图
             const skuMap = new Map();
 
             document.querySelectorAll(".specification-item-sku-image").forEach(img => {
@@ -401,219 +497,15 @@ class JDParser(BaseParser):
 
             result.sku_images = Array.from(skuMap.values()).slice(0, 30);
 
-            // ------------------------------------------------------------
-            // 4. 详情图：基于页面视觉边界识别
-            // ------------------------------------------------------------
-
-            const getAbsRect = (el) => {
-                const rect = el.getBoundingClientRect();
-
-                return {
-                    top: rect.top + window.scrollY,
-                    bottom: rect.bottom + window.scrollY,
-                    left: rect.left + window.scrollX,
-                    right: rect.right + window.scrollX,
-                    width: rect.width,
-                    height: rect.height
-                };
-            };
-
-            const getText = (el) => {
-                if (!el) return "";
-                return el.innerText ? el.innerText.trim() : "";
-            };
-
-            const findDetailStartY = () => {
-                const candidates = [];
-
-                document.querySelectorAll("*").forEach(el => {
-                    const text = getText(el);
-                    const id = el.id || "";
-                    const cls = el.className ? String(el.className) : "";
-
-                    if (!text && !id && !cls) return;
-
-                    const shortText = text.length <= 30;
-
-                    const hitByText =
-                        shortText && (
-                            text === "商品详情" ||
-                            text === "商品介绍" ||
-                            text === "图文详情" ||
-                            text.includes("商品详情") ||
-                            text.includes("商品介绍") ||
-                            text.includes("图文详情")
-                        );
-
-                    const hitById =
-                        id.includes("SPXQ") ||
-                        id === "detail" ||
-                        id === "J-detail" ||
-                        id === "J-detail-content";
-
-                    const hitByClass =
-                        cls === "detail-content" ||
-                        cls.includes("product-detail") ||
-                        cls.includes("ssd-module-wrap");
-
-                    if (hitByText || hitById || hitByClass) {
-                        const rect = getAbsRect(el);
-
-                        if (
-                            rect.top > 500 &&
-                            rect.width > 20 &&
-                            rect.height > 5
-                        ) {
-                            candidates.push({
-                                y: rect.top,
-                                text,
-                                id,
-                                cls
-                            });
-                        }
-                    }
-                });
-
-                candidates.sort((a, b) => a.y - b.y);
-
-                const exact = candidates.find(item =>
-                    item.text.includes("商品详情") ||
-                    item.text.includes("商品介绍") ||
-                    item.text.includes("图文详情") ||
-                    item.id.includes("SPXQ")
-                );
-
-                if (exact) return exact.y;
-
-                if (candidates.length > 0) {
-                    return candidates[0].y;
-                }
-
-                return 0;
-            };
-
-            const findDetailEndY = (startY) => {
-                const endKeywords = [
-                    "正品行货",
-                    "权利声明",
-                    "价格说明",
-                    "售后保障",
-                    "包装清单",
-                    "店铺推荐",
-                    "猜你喜欢",
-                    "为你推荐",
-                    "商品评价",
-                    "买家印象"
-                ];
-
-                const candidates = [];
-
-                document.querySelectorAll("*").forEach(el => {
-                    const text = getText(el);
-
-                    if (!text) return;
-                    if (text.length > 50) return;
-
-                    if (endKeywords.some(keyword => text.includes(keyword))) {
-                        const rect = getAbsRect(el);
-
-                        if (
-                            rect.top > startY + 100 &&
-                            rect.width > 20 &&
-                            rect.height > 5
-                        ) {
-                            candidates.push({
-                                y: rect.top,
-                                text
-                            });
-                        }
-                    }
-                });
-
-                candidates.sort((a, b) => a.y - b.y);
-
-                if (candidates.length > 0) {
-                    return candidates[0].y;
-                }
-
-                return startY + 8000;
-            };
-
-            const startY = findDetailStartY();
-            const endY = startY > 0 ? findDetailEndY(startY) : 0;
-
-            const isInDetailRange = (el) => {
-                if (!startY || !endY) return false;
-
-                const rect = getAbsRect(el);
-                const centerY = rect.top + rect.height / 2;
-
-                if (centerY <= startY) return false;
-                if (centerY >= endY) return false;
-
-                // 排除右侧浮动栏、客服栏、导航栏
-                if (rect.left < 0) return false;
-                if (rect.left > window.innerWidth - 80) return false;
-
-                // 详情图一般不会太小
-                if (rect.width < 120 && rect.height < 120) return false;
-
-                return true;
-            };
-
-            const isBadDetailUrl = (url) => {
-                if (!url) return true;
-
-                const lower = String(url).toLowerCase();
-
-                const badWords = [
-                    "logo",
-                    "icon",
-                    "sprite",
-                    "avatar",
-                    "qrcode",
-                    "qr-code",
-                    "shop",
-                    "store",
-                    "seller",
-                    "recommend",
-                    "comment",
-                    "evaluate",
-                    "service",
-                    "promise",
-                    "badge",
-                    "medal",
-                    "blank",
-                    "loading",
-                    "transparent",
-                    "arrow",
-                    "play",
-                    "pause",
-                    "video",
-                    "customer",
-                    "kefu",
-                    "consult",
-                    "dongdong",
-                    "smile",
-                    "face",
-                    "star",
-                    "rate",
-                    "score",
-                    "coupon",
-                    "gift",
-                    "imagetools",
-                    "shaidan",
-                    "default.image",
-                    "popshop",
-                    "elevator",
-                    "lachine",
-                    "calculator",
-                    "certificate",
-                    "qualification"
-                ];
-
-                return badWords.some(word => lower.includes(word));
-            };
+            // DOM 详情图兜底：只从明显详情模块中提取
+            const detailSelectors = [
+                ".ssd-module-wrap",
+                ".ssd-module",
+                "[class*='ssd-module']",
+                "[id*='ssd']",
+                "[class*='detail-content']",
+                "[class*='product-detail']"
+            ];
 
             const addDetailImage = (url, el) => {
                 url = cleanUrl(url);
@@ -622,31 +514,577 @@ class JDParser(BaseParser):
                 if (!isImageUrl(url)) return;
                 if (!isJdImage(url)) return;
                 if (isBadDetailUrl(url)) return;
-                if (isNoiseByClass(el)) return;
-                if (!isInDetailRange(el)) return;
+                if (el && isNoiseByClass(el)) return;
 
                 if (!result.detail_images.includes(url)) {
                     result.detail_images.push(url);
                 }
             };
 
-            // 从详情边界范围内抓 img
-            document.querySelectorAll("img").forEach(img => {
-                const url = getImgUrl(img);
-                addDetailImage(url, img);
+            detailSelectors.forEach(selector => {
+                document.querySelectorAll(selector).forEach(root => {
+                    if (isNoiseByClass(root)) return;
+
+                    root.querySelectorAll("img").forEach(img => {
+                        const url = getImgUrl(img);
+                        addDetailImage(url, img);
+                    });
+
+                    root.querySelectorAll("*").forEach(el => {
+                        const bgs = getBgUrls(el);
+
+                        bgs.forEach(bg => {
+                            addDetailImage(bg, el);
+                        });
+
+                        const attrs = [
+                            "src",
+                            "data-src",
+                            "data-lazyload",
+                            "data-original",
+                            "data-url",
+                            "data-origin",
+                            "data-lazy-img",
+                            "data-img"
+                        ];
+
+                        attrs.forEach(attr => {
+                            const val = el.getAttribute(attr);
+
+                            if (val) {
+                                addDetailImage(val, el);
+                            }
+                        });
+                    });
+                });
             });
 
-            // 从详情边界范围内抓 background-image
-            document.querySelectorAll("*").forEach(el => {
-                const bg = getBgUrl(el);
-                addDetailImage(bg, el);
-            });
-
-            result.detail_images = result.detail_images.slice(0, 100);
+            result.detail_images = result.detail_images.slice(0, 120);
 
             return result;
         }
         """
+
+    # ------------------------------------------------------------------
+    # 网络响应详情图提取
+    # ------------------------------------------------------------------
+
+    def _extract_detail_images_from_network_texts(self, network_texts: list[dict]) -> list[str]:
+        """
+        从 Playwright 捕获到的网络响应中提取京东详情图。
+
+        只分析当前商品图文详情接口 pc_item_getWareGraphic。
+        """
+
+        if not network_texts:
+            return []
+
+        graphic_items = []
+
+        for item in network_texts:
+            response_url = item.get("url", "")
+            text = item.get("text", "")
+
+            if not response_url or not text:
+                continue
+
+            lower_url = response_url.lower()
+
+            if (
+                "functionid=pc_item_getwaregraphic" in lower_url
+                or "pc_item_getwaregraphic" in lower_url
+            ):
+                graphic_items.append(item)
+
+        if not graphic_items:
+            return []
+
+        all_urls = []
+
+        for item in graphic_items:
+            text = item.get("text", "")
+
+            try:
+                urls = self._extract_jd_images_from_text(text)
+                urls = self._filter_detail_like_urls(urls)
+                urls = [
+                    u for u in urls
+                    if not self._is_bad_network_candidate(u)
+                ]
+
+                all_urls.extend(dedupe_urls(urls))
+
+            except Exception:
+                continue
+
+        return dedupe_urls(all_urls)
+
+    def _filter_detail_like_urls(self, urls: list[str]) -> list[str]:
+        """
+        过滤网络响应中提取出来的 URL，只保留可能是当前商品详情图的图片。
+        """
+
+        result = []
+
+        for url in urls:
+            if not url:
+                continue
+
+            url = self._normalize_jd_image_url(url, image_type="detail")
+
+            if not url:
+                continue
+
+            if not url.startswith("http://") and not url.startswith("https://"):
+                continue
+
+            lower = url.lower()
+
+            if self._is_bad_network_candidate(lower):
+                continue
+
+            if self._is_noise_image(lower):
+                continue
+
+            if "360buyimg.com" not in lower and "jdimg.com" not in lower:
+                continue
+
+            if not self._is_valid_image_url(lower):
+                continue
+
+            bad_path_signals = [
+                "storage.360buyimg.com",
+                "static.360buyimg.com",
+                "/devfe/",
+                "/error-new/",
+                "/static/",
+                "/logo/",
+                "/icon/",
+                "/sprite/",
+                "/avatar/",
+                "/comment/",
+                "/shaidan/",
+                "/popshop/",
+                "relsearch",
+                "diviner",
+                "mixer",
+            ]
+
+            if any(signal in lower for signal in bad_path_signals):
+                continue
+
+            good_path_signals = [
+                "/imgzone/",
+                "/sku/",
+                "/cms/",
+                "/jfs/",
+                "/pcpubliccms/",
+                "/image/",
+                "/n1/",
+                "/n0/",
+                "/ssd/",
+                "/desc/",
+                "/detail/",
+            ]
+
+            if not any(signal in lower for signal in good_path_signals):
+                continue
+
+            result.append(url)
+
+        return dedupe_urls(result)
+
+    def _is_bad_network_candidate(self, url: str) -> bool:
+        """
+        过滤网络响应中提取到的明显无关图片。
+        """
+
+        if not url:
+            return True
+
+        lower = url.lower()
+
+        bad_keywords = [
+            "storage.360buyimg.com",
+            "static.360buyimg.com/devfe",
+            "error-new",
+            "/error",
+            "try_03",
+            "try1_07",
+            "yinying_06",
+            "error_06",
+            "blank",
+            "loading",
+            "transparent",
+            "logo",
+            "icon",
+            "sprite",
+            "qrcode",
+            "qr-code",
+            "favicon",
+            "passport",
+            "login",
+            "captcha",
+            "comment",
+            "evaluate",
+            "recommend",
+            "relsearch",
+            "diviner",
+            "mixer",
+            "shaidan",
+            "popshop",
+            "shop",
+            "store",
+            "seller",
+            "service",
+            "promise",
+            "badge",
+            "medal",
+            "customer",
+            "kefu",
+            "dongdong",
+            "certificate",
+            "certification",
+            "qualification",
+            "license",
+            "licence",
+            "permit",
+            "businesslicense",
+            "business-license",
+            "aptitude",
+            "recordal",
+            "record",
+            "beian",
+            "icp",
+            "yyzz",
+            "wenwangwen",
+        ]
+
+        return any(k in lower for k in bad_keywords)
+
+    # ------------------------------------------------------------------
+    # 京东传统详情接口
+    # ------------------------------------------------------------------
+
+    def _fetch_jd_detail_images_from_api(self, product_id: str, product_url: str) -> list[str]:
+        """
+        使用 Python 请求京东传统详情接口，作为兜底方案。
+        """
+
+        if not product_id:
+            return []
+
+        api_urls = [
+            f"https://cd.jd.com/description/channel?skuId={product_id}&mainSkuId={product_id}&charset=utf-8&cdn=2",
+            f"https://cd.jd.com/description/channel?skuId={product_id}&mainSkuId={product_id}&charset=utf-8",
+            f"https://cd.jd.com/description/channel?skuId={product_id}&charset=utf-8&cdn=2",
+            f"https://cd.jd.com/description/channel?skuId={product_id}&charset=utf-8",
+            f"https://dx.3.cn/desc/{product_id}?cdn=2",
+        ]
+
+        headers = {
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/126.0.0.0 Safari/537.36"
+            ),
+            "Referer": product_url,
+            "Accept": "*/*",
+            "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+            "Connection": "keep-alive",
+        }
+
+        all_urls = []
+
+        for api_url in api_urls:
+            try:
+                with httpx.Client(
+                    headers=headers,
+                    timeout=15,
+                    follow_redirects=True,
+                    verify=False,
+                ) as client:
+                    response = client.get(api_url)
+
+                if response.status_code != 200:
+                    continue
+
+                text = response.text or ""
+
+                if len(text) < 50:
+                    continue
+
+                urls = self._extract_jd_images_from_text(text)
+                urls = self._filter_detail_like_urls(urls)
+                urls = [
+                    u for u in urls
+                    if not self._is_bad_network_candidate(u)
+                ]
+
+                if urls:
+                    all_urls.extend(urls)
+                    break
+
+            except Exception:
+                continue
+
+        return dedupe_urls(all_urls)
+
+    def _extract_jd_images_from_text(self, text: str) -> list[str]:
+        """
+        从京东接口 / 网络响应文本中提取图片 URL。
+        """
+
+        if not text:
+            return []
+
+        text = str(text)
+
+        text = text.replace("\\u003c", "<")
+        text = text.replace("\\u003C", "<")
+        text = text.replace("\\u003e", ">")
+        text = text.replace("\\u003E", ">")
+        text = text.replace("\\u002f", "/")
+        text = text.replace("\\u002F", "/")
+        text = text.replace("\\/", "/")
+
+        text = html_lib.unescape(text)
+
+        urls = []
+
+        def add_url_if_valid(raw_url: str, context: str = ""):
+            if not raw_url:
+                return
+
+            if self._is_bad_detail_context(context):
+                return
+
+            url = self._normalize_jd_image_url(raw_url, image_type="detail")
+
+            if not url:
+                return
+
+            if not url.startswith("http://") and not url.startswith("https://"):
+                return
+
+            lower = url.lower()
+
+            if "360buyimg.com" not in lower and "jdimg.com" not in lower:
+                return
+
+            if not self._is_valid_image_url(lower):
+                return
+
+            if self._is_noise_image(lower):
+                return
+
+            if self._is_bad_network_candidate(lower):
+                return
+
+            urls.append(url)
+
+        patterns = [
+            r'(?:https?:)?//[^\'"<>\\\s]+?(?:360buyimg\.com|jdimg\.com)/[^\'"<>\\\s]+?\.(?:jpg|jpeg|png|webp|avif)(?:![^\'"<>\\\s]*)?',
+        ]
+
+        for pattern in patterns:
+            for match in re.finditer(pattern, text, flags=re.I):
+                raw_url = match.group(0)
+
+                start = max(0, match.start() - 300)
+                end = min(len(text), match.end() + 300)
+                context = text[start:end]
+
+                add_url_if_valid(raw_url, context=context)
+
+        relative_patterns = [
+            r'(?<![a-zA-Z0-9_/])jfs/[^\'"<>\\\s]+?\.(?:jpg|jpeg|png|webp|avif)(?:![^\'"<>\\\s]*)?',
+            r'(?<![a-zA-Z0-9_/])/jfs/[^\'"<>\\\s]+?\.(?:jpg|jpeg|png|webp|avif)(?:![^\'"<>\\\s]*)?',
+            r'(?<![a-zA-Z0-9_/])t1/[^\'"<>\\\s]+?\.(?:jpg|jpeg|png|webp|avif)(?:![^\'"<>\\\s]*)?',
+            r'(?<![a-zA-Z0-9_/])/t1/[^\'"<>\\\s]+?\.(?:jpg|jpeg|png|webp|avif)(?:![^\'"<>\\\s]*)?',
+        ]
+
+        for pattern in relative_patterns:
+            for match in re.finditer(pattern, text, flags=re.I):
+                raw_url = match.group(0)
+
+                start = max(0, match.start() - 300)
+                end = min(len(text), match.end() + 300)
+                context = text[start:end]
+
+                add_url_if_valid(raw_url, context=context)
+
+        try:
+            soup = BeautifulSoup(text, "lxml")
+        except Exception:
+            soup = BeautifulSoup(text, "html.parser")
+
+        img_attrs = [
+            "src",
+            "data-src",
+            "data-lazyload",
+            "data-original",
+            "data-url",
+            "data-origin",
+            "data-lazy-img",
+            "data-img",
+        ]
+
+        for img in soup.find_all("img"):
+            parent = img.parent
+            context = ""
+
+            if parent:
+                context = parent.get_text(" ", strip=True)
+
+                grand = parent.parent
+                if grand:
+                    context += " " + grand.get_text(" ", strip=True)
+
+            if self._is_bad_detail_context(context):
+                continue
+
+            for attr in img_attrs:
+                value = img.get(attr)
+
+                if value:
+                    add_url_if_valid(value, context=context)
+
+        for tag in soup.find_all(True):
+            context = tag.get_text(" ", strip=True)
+
+            parent = tag.parent
+            if parent:
+                context += " " + parent.get_text(" ", strip=True)
+
+            if self._is_bad_detail_context(context):
+                continue
+
+            for attr, value in tag.attrs.items():
+                if not isinstance(value, str):
+                    continue
+
+                if (
+                    "360buyimg.com" not in value
+                    and "jdimg.com" not in value
+                    and "jfs/" not in value
+                    and "/jfs/" not in value
+                    and "t1/" not in value
+                    and "/t1/" not in value
+                ):
+                    continue
+
+                found_urls = self._extract_urls_from_possible_attr(value)
+
+                for found_url in found_urls:
+                    add_url_if_valid(found_url, context=context)
+
+        for tag in soup.find_all(True):
+            context = tag.get_text(" ", strip=True)
+
+            parent = tag.parent
+            if parent:
+                context += " " + parent.get_text(" ", strip=True)
+
+            if self._is_bad_detail_context(context):
+                continue
+
+            style = tag.get("style") or ""
+
+            if not style:
+                continue
+
+            for match in re.findall(r"url\([\"']?(.*?)[\"']?\)", style, flags=re.I):
+                add_url_if_valid(match, context=context)
+
+        return dedupe_urls(urls)
+
+    def _extract_urls_from_possible_attr(self, value: str) -> list[str]:
+        """
+        从属性值中提取可能的京东图片链接。
+        """
+
+        if not value:
+            return []
+
+        value = str(value)
+        value = html_lib.unescape(value)
+        value = value.replace("\\/", "/")
+        value = value.replace('\\"', '"')
+        value = value.replace("\\'", "'")
+
+        urls = []
+
+        patterns = [
+            r'(?:https?:)?//[^\'"<>\\\s]+?(?:360buyimg\.com|jdimg\.com)/[^\'"<>\\\s]+?\.(?:jpg|jpeg|png|webp|avif)(?:![^\'"<>\\\s]*)?',
+            r'(?<![a-zA-Z0-9_/])jfs/[^\'"<>\\\s]+?\.(?:jpg|jpeg|png|webp|avif)(?:![^\'"<>\\\s]*)?',
+            r'(?<![a-zA-Z0-9_/])/jfs/[^\'"<>\\\s]+?\.(?:jpg|jpeg|png|webp|avif)(?:![^\'"<>\\\s]*)?',
+            r'(?<![a-zA-Z0-9_/])t1/[^\'"<>\\\s]+?\.(?:jpg|jpeg|png|webp|avif)(?:![^\'"<>\\\s]*)?',
+            r'(?<![a-zA-Z0-9_/])/t1/[^\'"<>\\\s]+?\.(?:jpg|jpeg|png|webp|avif)(?:![^\'"<>\\\s]*)?',
+        ]
+
+        for pattern in patterns:
+            for match in re.findall(pattern, value, flags=re.I):
+                urls.append(match)
+
+        return urls
+
+    def _is_bad_detail_context(self, text: str) -> bool:
+        """
+        判断图片附近文本是否属于资质、证照、备案、许可证等非商品详情内容。
+        """
+
+        if not text:
+            return False
+
+        text = str(text).lower()
+
+        bad_keywords = [
+            "网络文化经营许可证",
+            "增值电信业务经营许可证",
+            "营业执照",
+            "食品经营许可证",
+            "医疗器械经营许可证",
+            "出版物经营许可证",
+            "互联网药品信息服务资格证书",
+            "开户许可证",
+            "许可证",
+            "经营许可证",
+            "资质证照",
+            "证照信息",
+            "商家资质",
+            "品牌授权",
+            "授权书",
+            "授权证书",
+            "备案",
+            "icp",
+            "京公网安备",
+            "营业执照信息",
+            "企业资质",
+            "资质信息",
+            "证书编号",
+            "经营者",
+            "统一社会信用代码",
+            "法定代表人",
+            "登记机关",
+            "核准日期",
+            "有效期",
+            "许可范围",
+            "license",
+            "licence",
+            "permit",
+            "certificate",
+            "certification",
+            "qualification",
+            "businesslicense",
+            "business-license",
+            "record",
+            "recordal",
+            "beian",
+            "aptitude",
+        ]
+
+        return any(keyword.lower() in text for keyword in bad_keywords)
 
     # ------------------------------------------------------------------
     # 标题处理
@@ -743,7 +1181,7 @@ class JDParser(BaseParser):
             if self._is_noise_image(lower):
                 continue
 
-            if "360buyimg.com" not in lower:
+            if "360buyimg.com" not in lower and "jdimg.com" not in lower:
                 continue
 
             result.append(url)
@@ -782,7 +1220,7 @@ class JDParser(BaseParser):
             if self._is_noise_image(lower):
                 continue
 
-            if "360buyimg.com" not in lower:
+            if "360buyimg.com" not in lower and "jdimg.com" not in lower:
                 continue
 
             result.append(
@@ -807,11 +1245,17 @@ class JDParser(BaseParser):
         for url in urls:
             url = self._normalize_jd_image_url(url, image_type="detail")
 
-            if url:
-                normalized.append(url)
+            if not url:
+                continue
+
+            if not url.startswith("http://") and not url.startswith("https://"):
+                continue
+
+            normalized.append(url)
 
         normalized = dedupe_urls(normalized)
         normalized = self._filter_detail_images(normalized)
+        normalized = dedupe_urls(normalized)
 
         return [
             ImageItem(
@@ -824,17 +1268,18 @@ class JDParser(BaseParser):
         ]
 
     def _filter_detail_images(self, urls: list[str]) -> list[str]:
-        """
-        京东详情图严格过滤。
-
-        详情图边界主要由 JS 根据页面坐标判断；
-        Python 这里做二次 URL 过滤。
-        """
-
         result = []
 
         for url in urls:
             if not url:
+                continue
+
+            url = self._normalize_jd_image_url(url, image_type="detail")
+
+            if not url:
+                continue
+
+            if not url.startswith("http://") and not url.startswith("https://"):
                 continue
 
             lower = url.lower()
@@ -842,28 +1287,13 @@ class JDParser(BaseParser):
             if not self._is_valid_image_url(lower):
                 continue
 
-            if "360buyimg.com" not in lower:
+            if "360buyimg.com" not in lower and "jdimg.com" not in lower:
                 continue
 
             if self._is_noise_image(lower):
                 continue
 
-            if "shaidan" in lower:
-                continue
-
-            if "default.image" in lower:
-                continue
-
-            if "imagetools" in lower:
-                continue
-
-            if "popshop" in lower:
-                continue
-
-            if "lachine" in lower:
-                continue
-
-            if "elevator" in lower:
+            if self._is_bad_network_candidate(lower):
                 continue
 
             allowed_signals = [
@@ -872,6 +1302,12 @@ class JDParser(BaseParser):
                 "/cms/",
                 "/jfs/",
                 "/pcpubliccms/",
+                "/image/",
+                "/n1/",
+                "/n0/",
+                "/ssd/",
+                "/desc/",
+                "/detail/",
             ]
 
             if not any(signal in lower for signal in allowed_signals):
@@ -886,23 +1322,65 @@ class JDParser(BaseParser):
     # ------------------------------------------------------------------
 
     def _normalize_jd_image_url(self, url: str, image_type: str = "main") -> str:
+        """
+        规范化京东图片 URL。
+        """
+
         if not url:
             return ""
 
         url = str(url).strip()
-        url = url.strip("'\"")
-        url = url.replace("\\/", "/")
         url = html_lib.unescape(url)
+
+        url = url.replace("\\/", "/")
+        url = url.replace('\\"', '"')
+        url = url.replace("\\'", "'")
+
+        url = url.strip()
+        url = url.strip("\\")
+        url = url.strip()
+        url = url.strip("'\"")
+        url = url.strip()
+        url = url.strip("\\")
+        url = url.strip("'\"\\ ")
+
+        if not (
+            url.startswith("http://")
+            or url.startswith("https://")
+            or url.startswith("//")
+            or url.startswith("/jfs/")
+            or url.startswith("jfs/")
+            or url.startswith("/t1/")
+            or url.startswith("t1/")
+        ):
+            m = re.search(
+                r'(?:https?:)?//[^\'"<>\\\s]+?(?:360buyimg\.com|jdimg\.com)/[^\'"<>\\\s]+?\.(?:jpg|jpeg|png|webp|avif)',
+                url,
+                flags=re.I,
+            )
+
+            if m:
+                url = m.group(0).strip("'\"\\ ")
 
         if url.startswith("//"):
             url = "https:" + url
 
-        # 避免 .jpg.avif 保存后扩展名混乱
+        if url.startswith("http://"):
+            url = "https://" + url[7:]
+
+        url = url.strip("'\"\\ ")
+
         url = url.replace(".jpg.avif", ".jpg")
         url = url.replace(".jpeg.avif", ".jpeg")
         url = url.replace(".png.avif", ".png")
 
-        # pcpubliccms 缩略图转原路径
+        url = re.sub(
+            r"!(q\d+|cc_\d+x\d+|s\d+x\d+|cr_\d+x\d+_\d+_\d+).*?$",
+            "",
+            url,
+            flags=re.I,
+        )
+
         url = re.sub(
             r"/pcpubliccms/s\d+x\d+_jfs/",
             "/pcpubliccms/jfs/",
@@ -910,7 +1388,6 @@ class JDParser(BaseParser):
             flags=re.I,
         )
 
-        # /n5/s54x54_jfs/... -> /n1/jfs/...
         url = re.sub(
             r"/n\d+/s\d+x\d+_jfs/",
             "/n1/jfs/",
@@ -936,6 +1413,9 @@ class JDParser(BaseParser):
             url = "jfs/" + url
             return self._build_jd_img_url(url, image_type=image_type)
 
+        if not url.startswith("http://") and not url.startswith("https://"):
+            return ""
+
         return normalize_image_url(url)
 
     def _build_jd_img_url(self, path: str, image_type: str = "main") -> str:
@@ -960,10 +1440,6 @@ class JDParser(BaseParser):
     def _is_noise_image(self, url: str) -> bool:
         """
         判断是否明显是无关图片。
-
-        注意：
-        不使用 'ad'、'free' 这种短词过滤，
-        避免误伤正常商品图 hash。
         """
 
         lower = url.lower()
@@ -978,7 +1454,6 @@ class JDParser(BaseParser):
             "shop",
             "store",
             "seller",
-            "banner",
             "recommend",
             "comment",
             "evaluate",
@@ -1011,8 +1486,26 @@ class JDParser(BaseParser):
             "elevator",
             "lachine",
             "calculator",
+            "error-new",
+            "try_03",
+            "try1_07",
+            "yinying_06",
+            "error_06",
             "certificate",
+            "certification",
             "qualification",
+            "license",
+            "licence",
+            "permit",
+            "businesslicense",
+            "business-license",
+            "aptitude",
+            "recordal",
+            "record",
+            "beian",
+            "icp",
+            "yyzz",
+            "wenwangwen",
         ]
 
         return any(keyword in lower for keyword in blacklist)

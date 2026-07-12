@@ -8,3 +8,8 @@ __pycache__/
 .DS_Store
 .idea/
 .vscode/
+
+debug/
+output/
+logs/
+browser_data/

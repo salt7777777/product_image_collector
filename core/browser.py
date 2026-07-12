@@ -14,7 +14,8 @@ class BrowserClient:
     4. 登录完成后继续采集；
     5. 尝试激活商品详情区域；
     6. 自动滚动触发懒加载；
-    7. 支持执行 JS 获取渲染后的 DOM 数据。
+    7. 支持执行 JS 获取渲染后的 DOM 数据；
+    8. 可选捕获网络响应文本，用于京东京东详情图接口定位。
     """
 
     def __init__(
@@ -109,16 +110,134 @@ class BrowserClient:
         url: str,
         js_script: str,
         wait_until: str = "domcontentloaded",
+        collect_network: bool = False,
     ):
         """
         打开页面，处理登录，尝试激活详情区域，滚动懒加载，
         然后执行 JS 获取渲染后的页面数据。
 
-        返回：
-            html, data
+        参数：
+            collect_network:
+                False：返回 html, data
+                True ：返回 html, data, network_texts
+
+        network_texts 格式：
+            [
+                {
+                    "url": "接口地址",
+                    "content_type": "响应类型",
+                    "text": "响应文本"
+                }
+            ]
         """
 
         self.user_data_dir.mkdir(parents=True, exist_ok=True)
+
+        network_texts = []
+        seen_response_urls = set()
+
+        def should_capture_response(response_url: str, content_type: str) -> bool:
+            """
+            判断是否捕获该网络响应。
+
+            主要面向京东详情图：
+            - description
+            - desc
+            - detail
+            - ware
+            - business
+            - ssd
+            - module
+            - item
+            - sku
+            """
+
+            if not response_url:
+                return False
+
+            lower_url = response_url.lower()
+            lower_type = content_type.lower() if content_type else ""
+
+            url_keywords = [
+                "description",
+                "desc",
+                "detail",
+                "ware",
+                "business",
+                "ssd",
+                "module",
+                "item",
+                "sku",
+                "pcpubliccms",
+                "cd.jd.com",
+                "dx.3.cn",
+                "api.m.jd.com",
+                "item-soa.jd.com",
+            ]
+
+            if not any(keyword in lower_url for keyword in url_keywords):
+                return False
+
+            allowed_types = [
+                "text",
+                "json",
+                "javascript",
+                "html",
+                "plain",
+            ]
+
+            if lower_type and not any(t in lower_type for t in allowed_types):
+                return False
+
+            return True
+
+        def handle_response(response):
+            """
+            捕获页面真实网络响应。
+
+            注意：
+            response.text() 在 Playwright sync API 中可以直接调用。
+            个别响应可能无法读取，会被 try 忽略。
+            """
+
+            if not collect_network:
+                return
+
+            try:
+                response_url = response.url
+
+                if response_url in seen_response_urls:
+                    return
+
+                headers = response.headers or {}
+                content_type = headers.get("content-type", "")
+
+                if not should_capture_response(response_url, content_type):
+                    return
+
+                text = response.text()
+
+                if not text or len(text) < 50:
+                    return
+
+                # 避免超大响应撑爆内存
+                max_len = 500000
+                saved_text = text[:max_len]
+
+                network_texts.append(
+                    {
+                        "url": response_url,
+                        "content_type": content_type,
+                        "text": saved_text,
+                    }
+                )
+
+                seen_response_urls.add(response_url)
+
+                # self.log(f"捕获网络响应：{response_url}，长度：{len(text)}")
+
+            except Exception:
+                pass
 
         with sync_playwright() as p:
             context = p.chromium.launch_persistent_context(
@@ -133,6 +252,9 @@ class BrowserClient:
 
             page = context.new_page()
             page.set_default_timeout(self.timeout)
+
+            if collect_network:
+                page.on("response", handle_response)
 
             self.log("正在打开商品页面...")
 
@@ -172,6 +294,14 @@ class BrowserClient:
             # 再滚动页面，触发懒加载
             self._auto_scroll(page)
 
+            # 网络响应可能在滚动后继续出现，这里稍微等一下
+            if collect_network:
+                try:
+                    page.wait_for_timeout(2500)
+                    page.wait_for_load_state("networkidle", timeout=5000)
+                except Exception:
+                    pass
+
             html = page.content()
 
             if self._looks_like_login_html(html, page.url):
@@ -188,6 +318,10 @@ class BrowserClient:
                 data = {}
 
             context.close()
+
+            if collect_network:
+                # self.log(f"网络响应采集完成，共捕获：{len(network_texts)} 条")
+                return html, data, network_texts
 
             return html, data
 
@@ -400,9 +534,9 @@ class BrowserClient:
             page.wait_for_timeout(500)
 
             # 慢速滚动到底部，触发懒加载
-            for _ in range(18):
+            for _ in range(24):
                 page.mouse.wheel(0, 900)
-                page.wait_for_timeout(500)
+                page.wait_for_timeout(450)
 
             # 再滚回商品详情附近，方便 JS 根据详情边界读取真实 DOM
             page.evaluate(
@@ -432,9 +566,9 @@ class BrowserClient:
             page.wait_for_timeout(1500)
 
             # 详情区域附近再滚几次，触发详情图懒加载
-            for _ in range(8):
+            for _ in range(12):
                 page.mouse.wheel(0, 800)
-                page.wait_for_timeout(600)
+                page.wait_for_timeout(550)
 
         except Exception:
             pass
