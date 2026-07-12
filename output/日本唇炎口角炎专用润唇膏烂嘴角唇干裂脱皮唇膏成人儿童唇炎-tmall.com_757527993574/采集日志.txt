@@ -1,0 +1,27 @@
+采集日志
+========================================
+采集时间：2026-07-11 14:40:48
+平台：tmall
+商品ID：757527993574
+商品标题：日本唇炎口角炎专用润唇膏烂嘴角唇干裂脱皮唇膏成人儿童唇炎-tmall.com
+商品链接：https://detail.tmall.com/item.htm?id=757527993574&pisk=h-qEU14nJadcONiLNlYvu3b15DeK6WxWV0GCS5lgT4x5JDgr45c_AXwIxuSuSW-5pD_-47lgee6-O63l48e0dXw55JepGU7-NuunSFDYIeDHxwqiTPmlGssfcJeK2WMdBLIkSActUYxot7cMIYGiEbD3Zf0inxOnq0VuIOkSnUAnK0mijvMnqBDHxh0invJHxvxnIOk-sYA3Z0XZjfHoqbVoqaQ64PiW1G3kX1t-ITME8b-S_fGOFvpxgJGNiOEwD2rNnrIPm2auHqEILg-tA-zijYrRnUlruzqIjkfGmV3kYzdv43NXFw5g27PLJ-RGllUQbqqaMpIgmgZaS5rWE9Ilu7zgADS1goq3tcP_aivGQky-DDw6yOZdJ8ebOu9RJlX7_koioAka0m62RP7kEmYJyVmxQj6IdUL--AHZGOWwyU3igAlfdv1..&spm=tbpc.mytb_followshop.item.goods
+保存路径：C:\Users\X\Desktop\product_image_collector\output\日本唇炎口角炎专用润唇膏烂嘴角唇干裂脱皮唇膏成人儿童唇炎-tmall.com_757527993574
+
+识别结果：
+主图：3 张
+详情图：38 张
+SKU图：2 张
+总计：43 张
+
+下载选择：
+主图：是
+详情图：是
+SKU图：是
+
+下载结果：
+计划下载：43 张
+成功下载：43 张
+失败下载：0 张
+成功率：100.0%
+
+失败明细：无
