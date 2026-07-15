@@ -13,3 +13,14 @@ debug/
 output/
 logs/
 browser_data/
+
+output/
+debug/
+logs/
+browser_data/
+.venv/
+venv/
+env/
+__pycache__/
+*.pyc
+.env
