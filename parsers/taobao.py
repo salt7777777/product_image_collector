@@ -40,15 +40,21 @@ class TaobaoParser(BaseParser):
     3. 不做整页 img 扫描。
     """
 
-    def __init__(self, log_callback=None):
-        """
-        :param log_callback: 日志回调函数，用于把解析器内部日志输出到 UI。
-        """
-        self.browser = BrowserClient(
-            headless=False,
-            login_wait_seconds=180,
+    def __init__(
+        self,
+        log_callback=None,
+        headless: bool = False,
+        login_wait_seconds: int = 180,
+    ):
+       """
+       :param log_callback: 日志回调函数，用于把解析器内部日志输出到 UI。
+       """
+       self.browser = BrowserClient(
+            headless=headless,
+            login_wait_seconds=login_wait_seconds,
             log_callback=log_callback,
         )
+
 
     def parse(self, url: str) -> ProductData:
         """

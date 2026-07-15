@@ -18,10 +18,13 @@ from PySide6.QtWidgets import (
     QCheckBox,
     QProgressBar,
     QMessageBox,
+    QSpinBox,
+    QComboBox,
 )
 
 from app.workers import BatchParseWorker, BatchDownloadWorker
 from core.preview_generator import PreviewGenerator
+from core.app_config import AppConfig
 
 
 class MainWindow(QMainWindow):
@@ -32,7 +35,7 @@ class MainWindow(QMainWindow):
     1. 单链接解析下载；
     2. 多链接批量解析下载；
     3. 自动简化商品长链接；
-    4. 导入 TXT / CSV 链接文件；
+    4. 导入 TXT / CSV / Excel 链接文件；
     5. 清空日志；
     6. 停止当前解析 / 下载任务；
     7. 主图 / 详情图 / SKU 图选择；
@@ -40,14 +43,22 @@ class MainWindow(QMainWindow):
     9. 图片 HTML 预览；
     10. 批量任务进度；
     11. 下载失败重试；
-    12. 批量下载报告和失败清单。
+    12. 批量下载报告、失败清单、Excel 报告；
+    13. 配置自动保存和恢复；
+    14. 下载超时、重试次数、登录等待时间配置；
+    15. 浏览器显示 / 隐藏配置；
+    16. 按日期 / 平台分类保存；
+    17. 下载后安全 MD5 去重；
+    18. 图片格式转换。
     """
 
     def __init__(self):
         super().__init__()
 
+        self.config = AppConfig.load()
+
         self.setWindowTitle("商品图片采集工具")
-        self.resize(900, 720)
+        self.resize(920, 780)
 
         self.product = None
         self.products = []
@@ -69,7 +80,7 @@ class MainWindow(QMainWindow):
 
         main_layout = QVBoxLayout(root)
 
-        # 链接输入区域
+        # 商品链接输入区域
         input_group = QGroupBox("商品链接")
         input_layout = QVBoxLayout(input_group)
 
@@ -77,7 +88,8 @@ class MainWindow(QMainWindow):
         self.url_input.setPlaceholderText(
             "请粘贴商品链接，支持单个或批量链接。\n"
             "批量链接建议每行一个。\n"
-            "长链接会自动简化，也可导入 TXT 文件。"
+            "支持导入 TXT / CSV / Excel 文件。\n"
+            "长链接会自动简化。"
         )
         self.url_input.setFixedHeight(110)
 
@@ -98,7 +110,7 @@ class MainWindow(QMainWindow):
 
         main_layout.addWidget(info_group)
 
-        # 识别结果区域
+        # 识别结果和下载类型
         result_group = QGroupBox("识别结果与下载类型")
         result_layout = QVBoxLayout(result_group)
 
@@ -120,10 +132,10 @@ class MainWindow(QMainWindow):
         self.sku_checkbox = QCheckBox("下载SKU图")
         self.high_quality_checkbox = QCheckBox("尽量下载高清图")
 
-        self.main_checkbox.setChecked(True)
-        self.detail_checkbox.setChecked(True)
-        self.sku_checkbox.setChecked(True)
-        self.high_quality_checkbox.setChecked(True)
+        self.main_checkbox.setChecked(self.config.download_main)
+        self.detail_checkbox.setChecked(self.config.download_detail)
+        self.sku_checkbox.setChecked(self.config.download_sku)
+        self.high_quality_checkbox.setChecked(self.config.high_quality)
 
         row2.addWidget(self.main_checkbox)
         row2.addWidget(self.detail_checkbox)
@@ -136,13 +148,77 @@ class MainWindow(QMainWindow):
 
         main_layout.addWidget(result_group)
 
+        # 高级设置区域
+        settings_group = QGroupBox("高级设置")
+        settings_layout = QVBoxLayout(settings_group)
+
+        settings_row1 = QHBoxLayout()
+
+        self.timeout_label = QLabel("下载超时(秒)：")
+        self.timeout_spinbox = QSpinBox()
+        self.timeout_spinbox.setRange(5, 120)
+        self.timeout_spinbox.setValue(self.config.download_timeout)
+
+        self.retries_label = QLabel("重试次数：")
+        self.retries_spinbox = QSpinBox()
+        self.retries_spinbox.setRange(0, 10)
+        self.retries_spinbox.setValue(self.config.download_retries)
+
+        self.login_wait_label = QLabel("登录等待(秒)：")
+        self.login_wait_spinbox = QSpinBox()
+        self.login_wait_spinbox.setRange(30, 600)
+        self.login_wait_spinbox.setValue(self.config.login_wait_seconds)
+
+        settings_row1.addWidget(self.timeout_label)
+        settings_row1.addWidget(self.timeout_spinbox)
+        settings_row1.addWidget(self.retries_label)
+        settings_row1.addWidget(self.retries_spinbox)
+        settings_row1.addWidget(self.login_wait_label)
+        settings_row1.addWidget(self.login_wait_spinbox)
+        settings_row1.addStretch()
+
+        settings_row2 = QHBoxLayout()
+
+        self.headless_checkbox = QCheckBox("隐藏浏览器窗口")
+        self.headless_checkbox.setChecked(self.config.headless)
+
+        self.organize_by_date_checkbox = QCheckBox("按日期分类保存")
+        self.organize_by_date_checkbox.setChecked(self.config.organize_by_date)
+
+        self.organize_by_platform_checkbox = QCheckBox("按平台分类保存")
+        self.organize_by_platform_checkbox.setChecked(self.config.organize_by_platform)
+
+        self.dedupe_images_checkbox = QCheckBox("下载后MD5去重")
+        self.dedupe_images_checkbox.setChecked(self.config.dedupe_images)
+
+        self.image_format_label = QLabel("输出格式：")
+        self.image_format_combo = QComboBox()
+        self.image_format_combo.addItem("保持原格式", "original")
+        self.image_format_combo.addItem("全部转 JPG", "jpg")
+        self.image_format_combo.addItem("全部转 PNG", "png")
+        self.image_format_combo.addItem("全部转 WEBP", "webp")
+        self._set_image_format_combo_value(self.config.image_output_format)
+
+        settings_row2.addWidget(self.headless_checkbox)
+        settings_row2.addWidget(self.organize_by_date_checkbox)
+        settings_row2.addWidget(self.organize_by_platform_checkbox)
+        settings_row2.addWidget(self.dedupe_images_checkbox)
+        settings_row2.addWidget(self.image_format_label)
+        settings_row2.addWidget(self.image_format_combo)
+        settings_row2.addStretch()
+
+        settings_layout.addLayout(settings_row1)
+        settings_layout.addLayout(settings_row2)
+
+        main_layout.addWidget(settings_group)
+
         # 保存路径区域
         path_group = QGroupBox("保存路径")
         path_layout = QHBoxLayout(path_group)
 
         self.path_input = QLineEdit()
         self.path_input.setPlaceholderText("请选择图片保存路径")
-        self.path_input.setText(str(Path("output").absolute()))
+        self.path_input.setText(self.config.save_dir)
 
         self.choose_path_button = QPushButton("选择目录")
 
@@ -203,10 +279,59 @@ class MainWindow(QMainWindow):
         self.import_links_button.clicked.connect(self.import_links_file)
         self.clear_log_button.clicked.connect(self.clear_log)
 
+        self.path_input.textChanged.connect(self.save_current_config)
+
+        self.main_checkbox.stateChanged.connect(self.save_current_config)
+        self.detail_checkbox.stateChanged.connect(self.save_current_config)
+        self.sku_checkbox.stateChanged.connect(self.save_current_config)
+        self.high_quality_checkbox.stateChanged.connect(self.save_current_config)
+
+        self.timeout_spinbox.valueChanged.connect(self.save_current_config)
+        self.retries_spinbox.valueChanged.connect(self.save_current_config)
+        self.login_wait_spinbox.valueChanged.connect(self.save_current_config)
+
+        self.headless_checkbox.stateChanged.connect(self.save_current_config)
+        self.organize_by_date_checkbox.stateChanged.connect(self.save_current_config)
+        self.organize_by_platform_checkbox.stateChanged.connect(self.save_current_config)
+        self.dedupe_images_checkbox.stateChanged.connect(self.save_current_config)
+        self.image_format_combo.currentIndexChanged.connect(self.save_current_config)
+
     def choose_path(self):
         path = QFileDialog.getExistingDirectory(self, "选择保存目录")
         if path:
             self.path_input.setText(path)
+
+    def save_current_config(self):
+        """
+        保存当前界面配置到 config.json。
+        """
+        try:
+            self.config.save_dir = self.path_input.text().strip() or str(Path("output").absolute())
+
+            self.config.download_main = self.main_checkbox.isChecked()
+            self.config.download_detail = self.detail_checkbox.isChecked()
+            self.config.download_sku = self.sku_checkbox.isChecked()
+            self.config.high_quality = self.high_quality_checkbox.isChecked()
+
+            self.config.download_timeout = self.timeout_spinbox.value()
+            self.config.download_retries = self.retries_spinbox.value()
+
+            self.config.headless = self.headless_checkbox.isChecked()
+            self.config.login_wait_seconds = self.login_wait_spinbox.value()
+
+            self.config.organize_by_date = self.organize_by_date_checkbox.isChecked()
+            self.config.organize_by_platform = self.organize_by_platform_checkbox.isChecked()
+            self.config.dedupe_images = self.dedupe_images_checkbox.isChecked()
+
+            self.config.image_output_format = self._get_image_format_combo_value()
+
+            self.config.save()
+
+        except Exception as e:
+            try:
+                self.log(f"保存配置失败：{e}")
+            except Exception:
+                pass
 
     # ------------------------------------------------------------------
     # 链接导入
@@ -214,14 +339,14 @@ class MainWindow(QMainWindow):
 
     def import_links_file(self):
         """
-        导入 TXT / CSV 链接文件。
+        导入 TXT / CSV / Excel 链接文件。
         """
 
         file_path, _ = QFileDialog.getOpenFileName(
             self,
             "导入链接文件",
             "",
-            "文本文件 (*.txt);;CSV文件 (*.csv);;所有文件 (*.*)",
+            "链接文件 (*.txt *.csv *.xlsx);;Excel文件 (*.xlsx);;文本文件 (*.txt);;CSV文件 (*.csv);;所有文件 (*.*)",
         )
 
         if not file_path:
@@ -229,13 +354,17 @@ class MainWindow(QMainWindow):
 
         try:
             path = Path(file_path)
+            suffix = path.suffix.lower()
 
-            try:
-                text = path.read_text(encoding="utf-8")
-            except UnicodeDecodeError:
-                text = path.read_text(encoding="gbk", errors="ignore")
+            if suffix == ".xlsx":
+                imported_urls = self._read_excel_links(path)
+            else:
+                try:
+                    text = path.read_text(encoding="utf-8")
+                except UnicodeDecodeError:
+                    text = path.read_text(encoding="gbk", errors="ignore")
 
-            imported_urls = self._extract_and_simplify_urls_from_text(text)
+                imported_urls = self._extract_and_simplify_urls_from_text(text)
 
             if not imported_urls:
                 QMessageBox.warning(self, "导入失败", "文件中未识别到有效商品链接。")
@@ -253,15 +382,212 @@ class MainWindow(QMainWindow):
                 seen.add(url)
                 merged.append(url)
 
+            added_count = max(len(merged) - len(current_urls), 0)
+            duplicate_count = max(len(imported_urls) - added_count, 0)
+
             self.url_input.setPlainText("\n".join(merged))
 
             self.log(
                 f"导入链接文件成功：{path.name}，"
-                f"新增识别链接 {len(imported_urls)} 个，当前共 {len(merged)} 个。"
+                f"识别链接 {len(imported_urls)} 个，"
+                f"新增 {added_count} 个，"
+                f"重复 {duplicate_count} 个，"
+                f"当前共 {len(merged)} 个。"
+            )
+
+        except ImportError:
+            QMessageBox.critical(
+                self,
+                "导入失败",
+                "导入 Excel 文件需要安装 openpyxl。\n\n请执行：\npip install openpyxl==3.1.5",
             )
 
         except Exception as e:
             QMessageBox.critical(self, "导入失败", f"导入链接文件失败：{e}")
+
+    def _read_excel_links(self, path: Path) -> list[str]:
+        """
+        从 Excel 文件中读取商品链接。
+        """
+        from openpyxl import load_workbook
+
+        workbook = load_workbook(
+            filename=path,
+            read_only=True,
+            data_only=True,
+        )
+
+        all_urls = []
+
+        try:
+            for sheet in workbook.worksheets:
+                urls = self._read_links_from_worksheet(sheet)
+                all_urls.extend(urls)
+
+        finally:
+            try:
+                workbook.close()
+            except Exception:
+                pass
+
+        return self._dedupe_url_list(all_urls)
+
+    def _read_links_from_worksheet(self, sheet) -> list[str]:
+        """
+        从单个 Excel Sheet 中读取链接。
+        """
+        result = []
+
+        url_column_index, header_row_index = self._find_excel_url_column(sheet)
+
+        if url_column_index is not None:
+            for row in sheet.iter_rows(
+                min_row=header_row_index + 1,
+                values_only=True,
+            ):
+                if not row:
+                    continue
+
+                if url_column_index >= len(row):
+                    continue
+
+                value = row[url_column_index]
+
+                if value is None:
+                    continue
+
+                text = str(value).strip()
+
+                if not text:
+                    continue
+
+                urls = self._extract_and_simplify_urls_from_text(text)
+                result.extend(urls)
+
+            return self._dedupe_url_list(result)
+
+        max_scan_rows = 10000
+        scanned_rows = 0
+
+        for row in sheet.iter_rows(values_only=True):
+            scanned_rows += 1
+
+            if scanned_rows > max_scan_rows:
+                break
+
+            if not row:
+                continue
+
+            for value in row:
+                if value is None:
+                    continue
+
+                text = str(value).strip()
+
+                if not text:
+                    continue
+
+                urls = self._extract_and_simplify_urls_from_text(text)
+                result.extend(urls)
+
+        return self._dedupe_url_list(result)
+
+    def _find_excel_url_column(self, sheet) -> tuple[int | None, int]:
+        """
+        尝试从 Excel 表头中识别商品链接列。
+        """
+
+        header_keywords = {
+            "商品链接",
+            "链接",
+            "url",
+            "商品url",
+            "商品地址",
+            "商品链接地址",
+            "地址",
+            "link",
+            "链接地址",
+            "商品页面",
+            "商品网址",
+        }
+
+        max_header_scan_rows = 10
+
+        for row_index, row in enumerate(
+            sheet.iter_rows(
+                min_row=1,
+                max_row=max_header_scan_rows,
+                values_only=True,
+            ),
+            start=1,
+        ):
+            if not row:
+                continue
+
+            for column_index, value in enumerate(row):
+                if value is None:
+                    continue
+
+                header_text = self._normalize_excel_header(str(value))
+
+                if not header_text:
+                    continue
+
+                if header_text in header_keywords:
+                    return column_index, row_index
+
+                if "url" in header_text:
+                    return column_index, row_index
+
+                if "链接" in header_text:
+                    return column_index, row_index
+
+                if "网址" in header_text:
+                    return column_index, row_index
+
+                if "地址" in header_text and "商品" in header_text:
+                    return column_index, row_index
+
+        return None, 1
+
+    def _normalize_excel_header(self, text: str) -> str:
+        """
+        规范化 Excel 表头。
+        """
+        if not text:
+            return ""
+
+        text = str(text).strip().lower()
+
+        text = text.replace(" ", "")
+        text = text.replace("\t", "")
+        text = text.replace("\n", "")
+        text = text.replace("\r", "")
+        text = text.replace("_", "")
+        text = text.replace("-", "")
+        text = text.replace("：", "")
+        text = text.replace(":", "")
+
+        return text
+
+    def _dedupe_url_list(self, urls: list[str]) -> list[str]:
+        """
+        URL 去重，保持顺序。
+        """
+        result = []
+        seen = set()
+
+        for url in urls:
+            if not url:
+                continue
+
+            if url in seen:
+                continue
+
+            seen.add(url)
+            result.append(url)
+
+        return result
 
     # ------------------------------------------------------------------
     # 解析
@@ -273,6 +599,8 @@ class MainWindow(QMainWindow):
         if not urls:
             QMessageBox.warning(self, "提示", "请先输入商品链接。")
             return
+
+        self.save_current_config()
 
         self.product = None
         self.products = []
@@ -298,7 +626,11 @@ class MainWindow(QMainWindow):
         self.stop_button.setEnabled(True)
         self.import_links_button.setEnabled(False)
 
-        self.parse_worker = BatchParseWorker(urls)
+        self.parse_worker = BatchParseWorker(
+            urls=urls,
+            headless=self.headless_checkbox.isChecked(),
+            login_wait_seconds=self.login_wait_spinbox.value(),
+        )
         self.parse_worker.log_signal.connect(self.log)
         self.parse_worker.progress_signal.connect(self.progress_bar.setValue)
         self.parse_worker.success_signal.connect(self.on_parse_success)
@@ -310,13 +642,6 @@ class MainWindow(QMainWindow):
     def on_parse_success(self, payload):
         """
         解析成功回调。
-
-        payload 格式：
-        {
-            "products": [...],
-            "failed": [...],
-            "stopped": False
-        }
         """
 
         if isinstance(payload, dict):
@@ -381,8 +706,6 @@ class MainWindow(QMainWindow):
     def on_parse_stopped(self, payload):
         """
         解析任务停止。
-
-        如果停止前已经解析出部分商品，则允许继续下载和预览这些商品。
         """
 
         if isinstance(payload, dict):
@@ -448,6 +771,8 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "提示", "请选择保存路径。")
             return
 
+        self.save_current_config()
+
         try:
             Path(base_dir).mkdir(parents=True, exist_ok=True)
 
@@ -478,6 +803,8 @@ class MainWindow(QMainWindow):
         if not base_dir:
             QMessageBox.warning(self, "提示", "请选择保存路径。")
             return
+
+        self.save_current_config()
 
         selected_types = {
             "main": self.main_checkbox.isChecked(),
@@ -511,6 +838,12 @@ class MainWindow(QMainWindow):
             selected_types=selected_types,
             failed_parse_items=self.failed_parse_items,
             high_quality=high_quality,
+            download_timeout=self.timeout_spinbox.value(),
+            download_retries=self.retries_spinbox.value(),
+            organize_by_date=self.organize_by_date_checkbox.isChecked(),
+            organize_by_platform=self.organize_by_platform_checkbox.isChecked(),
+            dedupe_images=self.dedupe_images_checkbox.isChecked(),
+            image_output_format=self._get_image_format_combo_value(),
         )
 
         self.download_worker.log_signal.connect(self.log)
@@ -533,14 +866,15 @@ class MainWindow(QMainWindow):
             f"计划下载：{result.total} 张\n"
             f"成功：{result.success} 张\n"
             f"失败：{result.failed} 张\n"
-            f"成功率：{result.success_rate}%",
+            f"成功率：{result.success_rate}%\n"
+            f"MD5去重处理：{result.duplicate_removed} 张\n"
+            f"格式转换成功：{result.converted_count} 张\n"
+            f"格式转换失败：{result.convert_failed} 张",
         )
 
     def on_download_stopped(self, payload):
         """
         下载任务停止。
-
-        已下载的文件会保留，报告和失败清单会生成。
         """
 
         if isinstance(payload, dict):
@@ -650,6 +984,36 @@ class MainWindow(QMainWindow):
         self.main_count_label.setText("主图：- 张")
         self.detail_count_label.setText("详情图：- 张")
         self.sku_count_label.setText("SKU图：- 张")
+
+    def _get_image_format_combo_value(self) -> str:
+        """
+        获取当前选择的图片输出格式。
+        """
+        if not hasattr(self, "image_format_combo"):
+            return "original"
+
+        value = self.image_format_combo.currentData()
+
+        if value in ["original", "jpg", "png", "webp"]:
+            return value
+
+        return "original"
+
+    def _set_image_format_combo_value(self, value: str) -> None:
+        """
+        设置图片输出格式下拉框。
+        """
+        if not hasattr(self, "image_format_combo"):
+            return
+
+        value = value or "original"
+
+        for index in range(self.image_format_combo.count()):
+            if self.image_format_combo.itemData(index) == value:
+                self.image_format_combo.setCurrentIndex(index)
+                return
+
+        self.image_format_combo.setCurrentIndex(0)
 
     def _get_urls(self, update_input: bool = True) -> list[str]:
         """
@@ -767,7 +1131,7 @@ class MainWindow(QMainWindow):
 
                 return url
 
-            # 拼多多 / 杨柿多
+            # 拼多多
             if "pinduoduo.com" in host or "yangkeduo.com" in host:
                 goods_id = query.get("goods_id", [""])[0]
 
@@ -780,3 +1144,10 @@ class MainWindow(QMainWindow):
 
         except Exception:
             return url
+
+    def closeEvent(self, event):
+        """
+        关闭窗口前保存配置。
+        """
+        self.save_current_config()
+        super().closeEvent(event)

@@ -2,6 +2,7 @@ import sys
 from pathlib import Path
 
 from PySide6.QtWidgets import QApplication
+
 from app.main_window import MainWindow
 
 
@@ -15,6 +16,11 @@ def load_qss(app: QApplication):
 
 
 def main():
+    Path("output").mkdir(parents=True, exist_ok=True)
+    Path("logs").mkdir(parents=True, exist_ok=True)
+    Path("debug").mkdir(parents=True, exist_ok=True)
+    Path("browser_data").mkdir(parents=True, exist_ok=True)
+
     app = QApplication(sys.argv)
     app.setApplicationName("商品图片采集工具")
 

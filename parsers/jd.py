@@ -26,12 +26,18 @@ class JDParser(BaseParser):
        - 自动去重。
     """
 
-    def __init__(self, log_callback=None):
-        self.browser = BrowserClient(
-            headless=False,
-            login_wait_seconds=180,
+    def __init__(
+        self,
+        log_callback=None,
+        headless: bool = False,
+        login_wait_seconds: int = 180,
+    ):
+       self.browser = BrowserClient(
+            headless=headless,
+            login_wait_seconds=login_wait_seconds,
             log_callback=log_callback,
         )
+
 
     def parse(self, url: str) -> ProductData:
         """

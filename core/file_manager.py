@@ -11,7 +11,49 @@ class FileManager:
     """
 
     @staticmethod
-    def create_product_dir(base_dir: str, product: ProductData) -> Path:
+    def resolve_output_base_dir(
+        base_dir: str,
+        product: ProductData,
+        organize_by_date: bool = False,
+        organize_by_platform: bool = False,
+    ) -> Path:
+        """
+        根据配置生成最终输出根目录。
+
+        示例：
+            output/
+            output/2026-07-15/
+            output/京东/
+            output/2026-07-15/京东/
+        """
+        path = Path(base_dir)
+
+        if organize_by_date:
+            date_name = datetime.now().strftime("%Y-%m-%d")
+            path = path / date_name
+
+        if organize_by_platform:
+            path = path / FileManager.get_platform_display_name(product.platform)
+
+        path.mkdir(parents=True, exist_ok=True)
+        return path
+
+    @staticmethod
+    def get_platform_display_name(platform: str) -> str:
+        """
+        平台名称转中文目录名。
+        """
+        mapping = {
+            "jd": "京东",
+            "taobao": "淘宝",
+            "tmall": "天猫",
+            "pdd": "拼多多",
+        }
+
+        return mapping.get(platform, platform or "未知平台")
+
+    @staticmethod
+    def create_product_dir(base_dir: str | Path, product: ProductData) -> Path:
         """
         根据商品标题和商品 ID 创建目录。
         """

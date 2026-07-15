@@ -4,20 +4,15 @@ from core.detector import PlatformDetector
 from core.downloader import ImageDownloader
 from core.file_manager import FileManager
 from core.task_logger import TaskLogger
-from core.models import DownloadResult
+from core.models import DownloadResult, DuplicateImage, ConvertedImage
 from parsers import get_parser
+from utils.file_hash import dedupe_image_files
+from utils.image_converter import convert_image_files
 
 
 class BatchParseWorker(QThread):
     """
     批量商品解析线程。
-
-    支持：
-    1. 单链接；
-    2. 多链接；
-    3. 单个失败不影响后续链接；
-    4. 返回成功商品列表和失败链接列表；
-    5. 支持停止任务。
     """
 
     log_signal = Signal(str)
@@ -26,9 +21,16 @@ class BatchParseWorker(QThread):
     error_signal = Signal(str)
     stopped_signal = Signal(object)
 
-    def __init__(self, urls: list[str]):
+    def __init__(
+        self,
+        urls: list[str],
+        headless: bool = False,
+        login_wait_seconds: int = 180,
+    ):
         super().__init__()
         self.urls = urls or []
+        self.headless = headless
+        self.login_wait_seconds = login_wait_seconds
         self._stop_requested = False
 
     def stop(self):
@@ -84,7 +86,13 @@ class BatchParseWorker(QThread):
                     )
                     self.log_signal.emit(f"{prefix} 开始解析商品数据...")
 
-                    parser = get_parser(platform, log_callback=self.log_signal.emit)
+                    parser = get_parser(
+                        platform,
+                        log_callback=self.log_signal.emit,
+                        headless=self.headless,
+                        login_wait_seconds=self.login_wait_seconds,
+                    )
+
                     product = parser.parse(url)
 
                     if self.is_stop_requested():
@@ -176,16 +184,6 @@ class BatchParseWorker(QThread):
 class BatchDownloadWorker(QThread):
     """
     批量图片下载线程。
-
-    支持：
-    1. 单商品下载；
-    2. 多商品批量下载；
-    3. 每个商品独立文件夹；
-    4. 下载失败自动重试；
-    5. 每个商品生成采集日志和商品 JSON；
-    6. 批量任务生成下载报告和失败清单；
-    7. 支持停止任务；
-    8. 支持高清图优先下载。
     """
 
     log_signal = Signal(str)
@@ -201,6 +199,12 @@ class BatchDownloadWorker(QThread):
         selected_types: dict[str, bool],
         failed_parse_items: list[dict] | None = None,
         high_quality: bool = False,
+        download_timeout: int = 20,
+        download_retries: int = 3,
+        organize_by_date: bool = False,
+        organize_by_platform: bool = False,
+        dedupe_images: bool = False,
+        image_output_format: str = "original",
     ):
         super().__init__()
         self.products = products or []
@@ -208,6 +212,12 @@ class BatchDownloadWorker(QThread):
         self.selected_types = selected_types
         self.failed_parse_items = failed_parse_items or []
         self.high_quality = high_quality
+        self.download_timeout = download_timeout
+        self.download_retries = download_retries
+        self.organize_by_date = organize_by_date
+        self.organize_by_platform = organize_by_platform
+        self.dedupe_images = dedupe_images
+        self.image_output_format = image_output_format or "original"
         self._stop_requested = False
 
     def stop(self):
@@ -246,7 +256,14 @@ class BatchDownloadWorker(QThread):
                 if total_products > 1:
                     self.log_signal.emit(f"{prefix} 开始下载：{product.title}")
 
-                product_dir = FileManager.create_product_dir(self.base_dir, product)
+                output_base_dir = FileManager.resolve_output_base_dir(
+                    base_dir=self.base_dir,
+                    product=product,
+                    organize_by_date=self.organize_by_date,
+                    organize_by_platform=self.organize_by_platform,
+                )
+
+                product_dir = FileManager.create_product_dir(output_base_dir, product)
                 last_product_dir = product_dir
 
                 dirs_by_type = FileManager.create_type_dirs(product_dir, self.selected_types)
@@ -258,8 +275,8 @@ class BatchDownloadWorker(QThread):
                 }
 
                 downloader = ImageDownloader(
-                    timeout=20,
-                    retries=3,
+                    timeout=self.download_timeout,
+                    retries=self.download_retries,
                     delay=0.3,
                     retry_delay=0.5,
                     high_quality=self.high_quality,
@@ -287,11 +304,137 @@ class BatchDownloadWorker(QThread):
                     cancel_callback=self.is_stop_requested,
                 )
 
+                # ------------------------------------------------------------
+                # 安全 MD5 去重
+                # ------------------------------------------------------------
+                if self.dedupe_images and not self.is_stop_requested():
+                    self.log_signal.emit(f"{prefix} 开始执行 MD5 图片去重...")
+                    self.log_signal.emit(
+                        f"{prefix} 安全模式：仅在同类型目录内去重，"
+                        f"重复图片移动到 _重复图片备份。"
+                    )
+
+                    dedupe_result = dedupe_image_files(
+                        root_dir=product_dir,
+                        same_folder_only=True,
+                        move_to_backup=True,
+                        min_file_size=1024,
+                    )
+
+                    result.duplicate_removed = dedupe_result.removed_count
+                    result.duplicate_removed_bytes = dedupe_result.removed_bytes
+                    result.duplicate_items = [
+                        DuplicateImage(
+                            original_path=item.original_path,
+                            duplicate_path=item.duplicate_path,
+                            md5=item.md5,
+                            size=item.size,
+                        )
+                        for item in dedupe_result.duplicate_items
+                    ]
+
+                    if dedupe_result.removed_count > 0:
+                        self.log_signal.emit(
+                            f"{prefix} MD5去重完成：扫描 {dedupe_result.scanned_count} 张，"
+                            f"发现重复图片 {dedupe_result.removed_count} 张，"
+                            f"已移动到 _重复图片备份。"
+                        )
+                    else:
+                        self.log_signal.emit(
+                            f"{prefix} MD5去重完成：扫描 {dedupe_result.scanned_count} 张，"
+                            f"未发现重复图片。"
+                        )
+
+                # ------------------------------------------------------------
+                # 图片格式转换
+                # ------------------------------------------------------------
+                # ------------------------------------------------------------
+
+                if self.image_output_format != "original" and not self.is_stop_requested():
+                    self.log_signal.emit(
+                        f"{prefix} 开始执行图片格式转换：{self.image_output_format.upper()}..."
+                    )
+                    self.log_signal.emit(
+                        f"{prefix} 格式转换可能需要一些时间，尤其是 PNG，请勿关闭程序。"
+                    )
+
+                    last_logged_percent = {"value": -1}
+
+                    def convert_progress_callback(current, total, path):
+                        if total <= 0:
+                            return
+
+                        percent = int(current / total * 100)
+
+                        # 进度条保持在 95% ~ 99%，表示当前处于后处理阶段
+                        progress_value = 95 + int(percent * 4 / 100)
+                        self.progress_signal.emit(min(progress_value, 99))
+
+                        # 避免刷屏：每 10% 或第一张 / 最后一张输出一次日志
+                        should_log = (
+                            current == 1
+                            or current == total
+                            or percent >= last_logged_percent["value"] + 10
+                        )
+
+                        if should_log:
+                            last_logged_percent["value"] = percent
+                            self.log_signal.emit(
+                                f"{prefix} 格式转换中：{current}/{total}，"
+                                f"进度 {percent}%"
+                            )
+
+                    convert_result = convert_image_files(
+                        root_dir=product_dir,
+                        target_format=self.image_output_format,
+                        backup_dir_name="_格式转换备份",
+                        exclude_dir_names={
+                            "_重复图片备份",
+                            "_格式转换备份",
+                            "_小图过滤",
+                        },
+                        quality=92,
+                        progress_callback=convert_progress_callback,
+                    )
+
+                    result.converted_count = convert_result.converted_count
+                    result.convert_failed = convert_result.failed_count
+                    result.converted_items = [
+                        ConvertedImage(
+                            original_path=item.original_path,
+                            output_path=item.output_path,
+                            backup_path=item.backup_path,
+                            source_format=item.source_format,
+                            target_format=item.target_format,
+                            success=item.success,
+                            reason=item.reason,
+                        )
+                        for item in convert_result.items
+                    ]
+
+                    self.progress_signal.emit(99)
+
+                    self.log_signal.emit(
+                        f"{prefix} 图片格式转换完成：扫描 {convert_result.scanned_count} 张，"
+                        f"转换成功 {convert_result.converted_count} 张，"
+                        f"跳过 {convert_result.skipped_count} 张，"
+                        f"失败 {convert_result.failed_count} 张。"
+                    )
+
+
                 finished_images += result.total
 
                 aggregate_result.success += result.success
                 aggregate_result.failed += result.failed
                 aggregate_result.failed_items.extend(result.failed_items)
+
+                aggregate_result.duplicate_removed += result.duplicate_removed
+                aggregate_result.duplicate_removed_bytes += result.duplicate_removed_bytes
+                aggregate_result.duplicate_items.extend(result.duplicate_items)
+
+                aggregate_result.converted_count += result.converted_count
+                aggregate_result.convert_failed += result.convert_failed
+                aggregate_result.converted_items.extend(result.converted_items)
 
                 TaskLogger.save_log(
                     product_dir=product_dir,
@@ -316,7 +459,10 @@ class BatchDownloadWorker(QThread):
 
                 if total_products > 1:
                     self.log_signal.emit(
-                        f"{prefix} 下载完成：成功 {result.success} 张，失败 {result.failed} 张。"
+                        f"{prefix} 下载完成：成功 {result.success} 张，"
+                        f"失败 {result.failed} 张，"
+                        f"去重处理 {result.duplicate_removed} 张，"
+                        f"格式转换 {result.converted_count} 张。"
                     )
 
                 if self.is_stop_requested():
@@ -332,6 +478,14 @@ class BatchDownloadWorker(QThread):
             )
 
             self.log_signal.emit(f"下载报告已生成：{report_paths['report_path']}")
+
+            if report_paths.get("excel_path"):
+                self.log_signal.emit(f"Excel报告已生成：{report_paths['excel_path']}")
+            else:
+                excel_error = report_paths.get("excel_error")
+                if excel_error:
+                    self.log_signal.emit(f"Excel报告生成失败：{excel_error}")
+
             self.log_signal.emit(f"失败清单已生成：{report_paths['failed_path']}")
 
             if self.is_stop_requested():
@@ -347,12 +501,18 @@ class BatchDownloadWorker(QThread):
             self.progress_signal.emit(100)
 
             if total_products == 1:
-                self.log_signal.emit(f"下载完成，成功率：{aggregate_result.success_rate}%")
+                self.log_signal.emit(
+                    f"下载完成，成功率：{aggregate_result.success_rate}%，"
+                    f"去重处理：{aggregate_result.duplicate_removed} 张，"
+                    f"格式转换：{aggregate_result.converted_count} 张"
+                )
             else:
                 self.log_signal.emit(
                     f"批量下载完成：商品 {total_products} 个，"
                     f"成功图片 {aggregate_result.success} 张，"
                     f"失败图片 {aggregate_result.failed} 张，"
+                    f"去重处理 {aggregate_result.duplicate_removed} 张，"
+                    f"格式转换 {aggregate_result.converted_count} 张，"
                     f"成功率 {aggregate_result.success_rate}%"
                 )
 

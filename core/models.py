@@ -7,6 +7,7 @@ class ImageItem:
     """
     单张图片信息。
     """
+
     url: str
     image_type: str  # main / detail / sku
     name: str = ""
@@ -20,6 +21,7 @@ class ProductData:
     """
     商品解析结果。
     """
+
     platform: str
     product_id: str
     title: str
@@ -38,6 +40,7 @@ class FailedDownload:
     """
     下载失败记录。
     """
+
     image_type: str
     url: str
     reason: str
@@ -45,14 +48,52 @@ class FailedDownload:
 
 
 @dataclass
+class DuplicateImage:
+    """
+    重复图片处理记录。
+    """
+
+    original_path: str
+    duplicate_path: str
+    md5: str
+    size: int = 0
+
+
+@dataclass
+class ConvertedImage:
+    """
+    图片格式转换记录。
+    """
+
+    original_path: str
+    output_path: str
+    backup_path: str
+    source_format: str
+    target_format: str
+    success: bool = True
+    reason: str = ""
+
+
+@dataclass
 class DownloadResult:
     """
     下载结果统计。
     """
+
     total: int = 0
     success: int = 0
     failed: int = 0
     failed_items: list[FailedDownload] = field(default_factory=list)
+
+    # MD5 去重统计
+    duplicate_removed: int = 0
+    duplicate_removed_bytes: int = 0
+    duplicate_items: list[DuplicateImage] = field(default_factory=list)
+
+    # 图片格式转换统计
+    converted_count: int = 0
+    convert_failed: int = 0
+    converted_items: list[ConvertedImage] = field(default_factory=list)
 
     @property
     def success_rate(self) -> float:

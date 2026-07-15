@@ -17,13 +17,17 @@ class PddParser(BaseParser):
     页面数据结构可能变化，需要根据实际测试继续增强。
     """
 
-    def __init__(self, log_callback=None):
+    def __init__(
+        self,
+        log_callback=None,
+        headless: bool = False,
+        login_wait_seconds: int = 180,
+    ):
         self.browser = BrowserClient(
-        headless=False,
-        login_wait_seconds=180,
-        log_callback=log_callback,
-    )
-
+            headless=headless,
+            login_wait_seconds=login_wait_seconds,
+            log_callback=log_callback,
+        )
 
     def parse(self, url: str) -> ProductData:
         platform, product_id = PlatformDetector.detect(url)
