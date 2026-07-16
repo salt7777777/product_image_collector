@@ -16,14 +16,12 @@ class Alibaba1688Parser(BaseParser):
     """
     1688 商品解析器。
 
-    优化重点：
-    1. 修复标题乱码问题；
-    2. 避免把公司名/店铺名当成商品标题；
-    3. 主图只从商品主图/相册相关区域提取；
-    4. 详情图优先从 descUrl 接口提取；
-    5. SKU 图只从 SKU 相关字段提取；
-    6. 严格过滤 7天、48小时、锁图标、播放按钮、店铺图标、服务保障图标等；
-    7. 主图、详情图、SKU 图之间去重。
+    当前策略：
+    1. 商品标题：优先商品标题字段，避免取公司名/店铺名；
+    2. 主图：优先从页面左侧主图/缩略图 DOM 区域提取；
+    3. 详情图：优先 descUrl 接口，兜底只取详情相关字段；
+    4. SKU 图：从 SKU DOM / background-image / SKU JSON 中提取；
+    5. 过滤服务图标、7天、48小时、店铺图标、UI 图标等。
     """
 
     def __init__(
@@ -55,10 +53,14 @@ class Alibaba1688Parser(BaseParser):
             title = f"1688商品_{product_id or 'unknown'}"
 
         self._log("正在解析 1688 主图...")
+
+        # 主图候选集：用于后面从详情图中排除主图。
+        # 注意：这里直接从 DOM 拿一份候选，不代表最终主图全部使用这些。
+        main_gallery_candidates = self._parse_main_images_from_dom(soup)
         main_urls = self._parse_main_image_urls(html, soup)
 
         self._log("正在解析 1688 SKU 图...")
-        sku_urls = self._parse_sku_image_urls(html)
+        sku_urls = self._parse_sku_image_urls(html, soup)
 
         self._log("正在解析 1688 详情图...")
         detail_urls = self._parse_detail_image_urls(html, url)
@@ -68,8 +70,14 @@ class Alibaba1688Parser(BaseParser):
         sku_urls = self._dedupe_keep_order(sku_urls)
         detail_urls = self._dedupe_keep_order(detail_urls)
 
-        # 类型之间去重
-        main_set = set(self._image_dedupe_key(u) for u in main_urls)
+        # 详情图排除主图与 SKU 图。
+        # 这里不仅排除最终 main_urls，也排除 main_gallery_candidates，
+        # 避免左侧主图缩略图被详情图兜底逻辑再次收进去。
+        main_exclude_urls = []
+        main_exclude_urls.extend(main_urls)
+        main_exclude_urls.extend(main_gallery_candidates)
+
+        main_set = set(self._image_dedupe_key(u) for u in main_exclude_urls)
         sku_set = set(self._image_dedupe_key(u) for u in sku_urls)
 
         detail_urls = [
@@ -78,17 +86,12 @@ class Alibaba1688Parser(BaseParser):
             and self._image_dedupe_key(u) not in sku_set
         ]
 
-        # 主图里排除 SKU 图
-        sku_set = set(self._image_dedupe_key(u) for u in sku_urls)
-        main_urls = [
-            u for u in main_urls
-            if self._image_dedupe_key(u) not in sku_set
-        ]
+        # 不从主图里排除 SKU 图。
+        # 1688 很多商品 SKU 图本身就是主图之一。
 
-        # 数量限制，防止异常页面污染
-        main_urls = main_urls[:12]
-        detail_urls = detail_urls[:100]
-        sku_urls = sku_urls[:60]
+        main_urls = main_urls[:8]
+        detail_urls = detail_urls[:120]
+        sku_urls = sku_urls[:40]
 
         main_images = self._build_images(main_urls, "main", "1688_main")
         detail_images = self._build_images(detail_urls, "detail", "1688_detail")
@@ -121,7 +124,6 @@ class Alibaba1688Parser(BaseParser):
         这些不是商品标题，需要排除。
         """
 
-        # 1. 优先 meta 标题
         meta_selectors = [
             ("meta", {"property": "og:title"}),
             ("meta", {"name": "og:title"}),
@@ -137,7 +139,6 @@ class Alibaba1688Parser(BaseParser):
                 if self._is_valid_title(title):
                     return title
 
-        # 2. h1 / 商品标题区域
         selectors = [
             "h1",
             ".offer-title",
@@ -163,7 +164,6 @@ class Alibaba1688Parser(BaseParser):
 
         text = self._decode_text(html)
 
-        # 3. JSON 字段
         patterns = [
             r'"subject"\s*:\s*"([^"]{3,300})"',
             r'"offerTitle"\s*:\s*"([^"]{3,300})"',
@@ -181,7 +181,6 @@ class Alibaba1688Parser(BaseParser):
                 start = max(0, m.start() - 120)
                 prefix = text[start:m.start()].lower()
 
-                # 排除公司、店铺、卖家上下文
                 if any(k in prefix for k in [
                     "company",
                     "companyname",
@@ -201,7 +200,6 @@ class Alibaba1688Parser(BaseParser):
                 if self._is_valid_title(title):
                     return title
 
-        # 4. document title 兜底
         if soup.title:
             title = soup.title.get_text(" ", strip=True)
             title = self._clean_title(title)
@@ -256,7 +254,6 @@ class Alibaba1688Parser(BaseParser):
             "经营模式",
         ]
 
-        # 短文本里出现这些词，大概率是公司名/店铺名
         if any(w in title for w in bad_words) and len(title) <= 60:
             return False
 
@@ -281,78 +278,55 @@ class Alibaba1688Parser(BaseParser):
         """
         解析 1688 主图。
 
-        主图只从商品主图/相册相关字段和主图容器中取。
-        不从全页面扫图，避免混入详情图、服务图标。
-        """
-        text = self._decode_text(html)
+        优先采集页面左侧缩略图区域。
 
+        注意：
+            1688 左侧主图本身可能包含营销风格图，
+            例如快充图、新品图、功能图。
+            只要它出现在左侧主图缩略图区域，就应该算主图。
+        """
         urls: list[str] = []
 
-        main_keys = [
-            "offerImgList",
-            "offerImageList",
-            "mainImageList",
-            "mainImages",
-            "main_images",
-            "albumImages",
-            "albumImageList",
-            "productImageList",
-            "productImages",
-            "imageList",
-            "image_list",
-        ]
+        # 1. 优先 DOM 主图区域
+        dom_urls = self._parse_main_images_from_dom(soup)
 
-        for key in main_keys:
-            for block in self._extract_json_like_blocks_by_key(text, key, max_len=6000):
-                block_urls = self._extract_image_urls_from_text(block)
+        if dom_urls:
+            dom_urls = self._normalize_urls(dom_urls)
+            dom_urls = [
+                u for u in dom_urls
+                if self._is_likely_product_image(u, image_type="main")
+            ]
+            dom_urls = self._dedupe_keep_order(dom_urls)
+            urls.extend(dom_urls)
 
-                for u in block_urls:
-                    if not self._is_likely_product_image(u, image_type="main"):
-                        continue
+        # 2. 如果 DOM 主图不足，再从严格 JSON 字段补充
+        if len(urls) < 6:
+            text = self._decode_text(html)
 
-                    if self._is_service_or_ui_context(block, u):
-                        continue
+            main_keys = [
+                "offerImgList",
+                "offerImageList",
+                "mainImageList",
+                "mainImages",
+                "main_images",
+                "albumImages",
+                "albumImageList",
+                "productImageList",
+                "productImages",
+            ]
 
-                    urls.append(u)
+            for key in main_keys:
+                for block in self._extract_json_like_blocks_by_key(text, key, max_len=5000):
+                    block_urls = self._extract_image_urls_from_text(block)
 
-        # 只从疑似主图容器取图
-        container_selectors = [
-            "[class*=main-image]",
-            "[class*=mainImage]",
-            "[class*=image-list]",
-            "[class*=imageList]",
-            "[class*=album]",
-            "[class*=gallery]",
-            "[class*=preview]",
-            "[class*=magnifier]",
-            "[class*=vertical-img]",
-        ]
-
-        for selector in container_selectors:
-            try:
-                nodes = soup.select(selector)
-            except Exception:
-                nodes = []
-
-            for node in nodes[:8]:
-                node_text = str(node)
-                for img in node.find_all("img"):
-                    for attr in [
-                        "src",
-                        "data-src",
-                        "data-original",
-                        "data-lazy-src",
-                        "data-img",
-                        "data-url",
-                    ]:
-                        value = img.get(attr)
-                        if not value:
+                    for u in block_urls:
+                        if not self._is_likely_product_image(u, image_type="main"):
                             continue
 
-                        if self._is_service_or_ui_context(node_text, value):
+                        if self._is_service_or_ui_context(block, u):
                             continue
 
-                        urls.append(value)
+                        urls.append(u)
 
         urls = self._normalize_urls(urls)
 
@@ -363,22 +337,134 @@ class Alibaba1688Parser(BaseParser):
 
         urls = self._dedupe_keep_order(urls)
 
-        return urls[:12]
+        # 1688 左侧主图一般 5~8 张，包含视频封面/参数图时可能更多。
+        return urls[:8]
+
+    def _parse_main_images_from_dom(self, soup: BeautifulSoup) -> list[str]:
+        """
+        从页面左侧主图/缩略图 DOM 区域提取主图。
+
+        这里不要过滤所谓“营销图”，因为 1688 左侧主图区域本身
+        经常包含营销风格主图。
+        """
+        urls: list[str] = []
+
+        selectors = [
+            "[class*=detail-gallery]",
+            "[class*=gallery]",
+            "[class*=album]",
+            "[class*=main-image]",
+            "[class*=mainImage]",
+            "[class*=image-list]",
+            "[class*=imageList]",
+            "[class*=preview]",
+            "[class*=magnifier]",
+            "[class*=vertical-img]",
+            "[class*=verticalImg]",
+            "[class*=thumb]",
+            "[class*=thumbnail]",
+        ]
+
+        for selector in selectors:
+            try:
+                nodes = soup.select(selector)
+            except Exception:
+                nodes = []
+
+            for node in nodes[:15]:
+                node_text = str(node)
+                lower_node_text = node_text.lower()
+
+                # 排除明显详情/店铺/服务区域。
+                # 但如果同时明显是主图容器，不排除。
+                if any(k in lower_node_text for k in [
+                    "description",
+                    "detail-content",
+                    "rich-text",
+                    "service",
+                    "guarantee",
+                    "shop",
+                    "seller",
+                    "company",
+                ]):
+                    if not any(k in lower_node_text for k in [
+                        "gallery",
+                        "album",
+                        "main-image",
+                        "mainimage",
+                        "preview",
+                        "magnifier",
+                        "thumb",
+                        "thumbnail",
+                        "image-list",
+                        "imagelist",
+                    ]):
+                        continue
+
+                # 1. img 标签
+                for img in node.find_all("img"):
+                    width = img.get("width") or ""
+                    height = img.get("height") or ""
+
+                    try:
+                        w = int(re.sub(r"\D", "", str(width)) or "0")
+                        h = int(re.sub(r"\D", "", str(height)) or "0")
+                        if w and h and (w < 35 or h < 35):
+                            continue
+                    except Exception:
+                        pass
+
+                    for attr in [
+                        "src",
+                        "data-src",
+                        "data-original",
+                        "data-lazy-src",
+                        "data-img",
+                        "data-url",
+                        "data-lazyload",
+                    ]:
+                        value = img.get(attr)
+                        if not value:
+                            continue
+
+                        if self._is_service_or_ui_context(node_text, value):
+                            continue
+
+                        urls.append(value)
+
+                # 2. background-image，部分主图缩略图可能是背景图
+                style_urls = self._extract_background_image_urls(node_text)
+                for value in style_urls:
+                    if not value:
+                        continue
+
+                    if self._is_service_or_ui_context(node_text, value):
+                        continue
+
+                    urls.append(value)
+
+        return urls
 
     # ------------------------------------------------------------------
     # SKU 图解析
     # ------------------------------------------------------------------
 
-    def _parse_sku_image_urls(self, html: str) -> list[str]:
+    def _parse_sku_image_urls(self, html: str, soup: BeautifulSoup) -> list[str]:
         """
         解析 1688 SKU 图。
 
-        只从 SKU 图片相关字段取图。
-        避免从 saleProps / skuMap 这类宽泛字段误抓服务图标。
+        当前策略：
+        1. 优先从页面 SKU DOM 区域提取；
+        2. 支持 background-image；
+        3. 再从 SKU JSON 字段兜底。
         """
-        text = self._decode_text(html)
-
         urls: list[str] = []
+
+        dom_urls = self._parse_sku_images_from_dom(soup)
+        if dom_urls:
+            urls.extend(dom_urls)
+
+        text = self._decode_text(html)
 
         sku_keys = [
             "skuProps",
@@ -406,18 +492,126 @@ class Alibaba1688Parser(BaseParser):
                     if self._is_service_or_ui_context(block, u):
                         continue
 
+                    if self._is_detail_marketing_context(block, u):
+                        continue
+
                     urls.append(u)
 
         urls = self._normalize_urls(urls)
-
         urls = [
             u for u in urls
             if self._is_likely_product_image(u, image_type="sku")
         ]
-
         urls = self._dedupe_keep_order(urls)
 
-        return urls[:60]
+        return urls[:40]
+
+    def _parse_sku_images_from_dom(self, soup: BeautifulSoup) -> list[str]:
+        """
+        从页面 SKU 区域提取 SKU 图。
+
+        兼容：
+        1. img 标签；
+        2. background-image 背景图；
+        3. 型号 C4 这类单规格商品。
+        """
+        urls: list[str] = []
+
+        selectors = [
+            "[class*=sku]",
+            "[class*=Sku]",
+            "[class*=sale-prop]",
+            "[class*=saleProp]",
+            "[class*=prop-item]",
+            "[class*=propItem]",
+            "[class*=spec]",
+            "[class*=model]",
+            "[class*=offer-attr]",
+            "[class*=attribute]",
+        ]
+
+        for selector in selectors:
+            try:
+                nodes = soup.select(selector)
+            except Exception:
+                nodes = []
+
+            for node in nodes[:50]:
+                node_text = str(node)
+                plain_text = node.get_text(" ", strip=True)
+
+                if not self._looks_like_sku_node(plain_text, node_text):
+                    continue
+
+                # 1. 提取 background-image
+                style_urls = self._extract_background_image_urls(node_text)
+                for value in style_urls:
+                    if not value:
+                        continue
+
+                    if self._is_service_or_ui_context(node_text, value):
+                        continue
+
+                    if self._is_detail_marketing_context(node_text, value):
+                        continue
+
+                    urls.append(value)
+
+                # 2. 提取 img
+                for img in node.find_all("img"):
+                    for attr in [
+                        "src",
+                        "data-src",
+                        "data-original",
+                        "data-lazy-src",
+                        "data-img",
+                        "data-url",
+                        "data-lazyload",
+                    ]:
+                        value = img.get(attr)
+                        if not value:
+                            continue
+
+                        if self._is_service_or_ui_context(node_text, value):
+                            continue
+
+                        if self._is_detail_marketing_context(node_text, value):
+                            continue
+
+                        urls.append(value)
+
+        return urls
+
+    def _looks_like_sku_node(self, plain_text: str, html_text: str) -> bool:
+        """
+        判断 DOM 节点是否像 SKU 区域。
+        """
+        text = f"{plain_text} {html_text}".lower()
+
+        good_words = [
+            "sku",
+            "规格",
+            "型号",
+            "颜色",
+            "尺寸",
+            "款式",
+            "类型",
+            "model",
+            "spec",
+            "prop",
+            "attribute",
+            "sale-prop",
+            "saleprop",
+        ]
+
+        if any(w in text for w in good_words):
+            return True
+
+        # 识别类似 C4、A1、X10 这种短型号
+        if re.search(r"\b[a-z]\d{1,3}\b", text, re.I):
+            return True
+
+        return False
 
     # ------------------------------------------------------------------
     # 详情图解析
@@ -428,7 +622,11 @@ class Alibaba1688Parser(BaseParser):
         解析详情图。
 
         优先请求 descUrl 接口。
-        如果 descUrl 不存在，再从详情相关 JSON 块里提取。
+        如果 descUrl 不存在，再从严格详情相关 JSON 块里提取。
+
+        注意：
+            不再使用 description / offerDetail / productDetail 等过宽字段，
+            避免把主图、SKU 图混进详情图。
         """
         text = self._decode_text(html)
 
@@ -451,16 +649,12 @@ class Alibaba1688Parser(BaseParser):
             detail_urls = self._extract_detail_images_from_desc_html(detail_html)
             urls.extend(detail_urls)
 
-        # 如果 descUrl 没取到，再尝试详情相关 JSON 块
+        # 兜底只保留严格详情字段，避免详情图数量异常增多。
         if not urls:
             detail_keys = [
-                "descUrl",
-                "description",
-                "offerDetail",
                 "detailContent",
                 "detailImages",
                 "detail_images",
-                "productDetail",
                 "richText",
             ]
 
@@ -478,15 +672,13 @@ class Alibaba1688Parser(BaseParser):
                         urls.append(u)
 
         urls = self._normalize_urls(urls)
-
         urls = [
             u for u in urls
             if self._is_likely_product_image(u, image_type="detail")
         ]
-
         urls = self._dedupe_keep_order(urls)
 
-        return urls[:100]
+        return urls[:120]
 
     def _extract_desc_urls(self, text: str, page_url: str) -> list[str]:
         urls = []
@@ -527,7 +719,6 @@ class Alibaba1688Parser(BaseParser):
 
         content_candidates = []
 
-        # desc 接口常见返回 content 字段
         patterns = [
             r'"content"\s*:\s*"(.+?)"\s*(?:,\s*"|\})',
             r"'content'\s*:\s*'(.+?)'\s*(?:,\s*'|\})",
@@ -565,11 +756,10 @@ class Alibaba1688Parser(BaseParser):
                     if value:
                         urls.append(value)
 
-            # 有些详情内容是转义字符串，再正则扫一次
+            # 详情内容可能是转义字符串，再正则扫一次
             urls.extend(self._extract_image_urls_from_text(content))
 
         urls = self._normalize_urls(urls)
-
         urls = [
             u for u in urls
             if self._is_likely_product_image(u, image_type="detail")
@@ -589,8 +779,6 @@ class Alibaba1688Parser(BaseParser):
     ) -> list[str]:
         """
         按 key 提取附近文本块。
-
-        不尝试完整解析整页 JS，因为 1688 页面 JS 结构经常变化。
         """
         blocks = []
 
@@ -647,6 +835,30 @@ class Alibaba1688Parser(BaseParser):
 
         return urls
 
+    def _extract_background_image_urls(self, text: str) -> list[str]:
+        """
+        提取 style="background-image:url(...)" 里的图片。
+        1688 SKU 小图、主图缩略图有时不是 img 标签，而是背景图。
+        """
+        if not text:
+            return []
+
+        text = self._decode_text(text)
+
+        urls = []
+
+        patterns = [
+            r'background-image\s*:\s*url\(["\']?([^"\')]+)["\']?\)',
+            r'background\s*:\s*url\(["\']?([^"\')]+)["\']?\)',
+            r'url\(["\']?((?:https?:)?//[^"\')]+?\.(?:jpg|jpeg|png|webp)[^"\')]*)["\']?\)',
+        ]
+
+        for pattern in patterns:
+            for m in re.finditer(pattern, text, re.I):
+                urls.append(m.group(1))
+
+        return urls
+
     # ------------------------------------------------------------------
     # URL 标准化 / 过滤
     # ------------------------------------------------------------------
@@ -677,7 +889,6 @@ class Alibaba1688Parser(BaseParser):
         if not url.startswith("http"):
             return ""
 
-        # 去掉尾部非法字符
         url = url.rstrip("\\")
         url = url.rstrip(",")
         url = url.rstrip(";")
@@ -686,7 +897,6 @@ class Alibaba1688Parser(BaseParser):
         url = url.rstrip("}")
 
         # 还原阿里图片缩略图后缀
-        # xxx.jpg_300x300.jpg -> xxx.jpg
         url = re.sub(
             r'(\.(?:jpg|jpeg|png|webp))_\d+x\d+(?:q\d+)?\.(?:jpg|jpeg|png|webp)$',
             r'\1',
@@ -708,7 +918,6 @@ class Alibaba1688Parser(BaseParser):
             flags=re.I,
         )
 
-        # 去掉 OSS 处理参数
         url = re.sub(r'([?&])x-oss-process=image/resize[^&]*', r'\1', url)
 
         try:
@@ -721,8 +930,6 @@ class Alibaba1688Parser(BaseParser):
     def _is_likely_product_image(self, url: str, image_type: str = "") -> bool:
         """
         判断是否像商品图片。
-
-        这里是 1688 解析准确率的关键。
         """
         if not url:
             return False
@@ -732,11 +939,9 @@ class Alibaba1688Parser(BaseParser):
         if not u.startswith("http"):
             return False
 
-        # 必须是图片 URL
         if not re.search(r'\.(jpg|jpeg|png|webp)(?:$|\?|_)', u, re.I):
             return False
 
-        # 常见非商品图关键词
         bad_keywords = [
             "icon",
             "logo",
@@ -822,7 +1027,6 @@ class Alibaba1688Parser(BaseParser):
         if any(k in u for k in bad_keywords):
             return False
 
-        # 过滤明显小尺寸 URL
         small_patterns = [
             "12x12",
             "16x16",
@@ -849,7 +1053,6 @@ class Alibaba1688Parser(BaseParser):
         if any(p in u for p in small_patterns):
             return False
 
-        # 阿里 UI 素材路径，很多不是商品图
         bad_path_keywords = [
             "/tps/",
             "/tfs/",
@@ -859,7 +1062,6 @@ class Alibaba1688Parser(BaseParser):
         if any(k in u for k in bad_path_keywords):
             return False
 
-        # 1688 商品图通常在这些域/路径
         good_keywords = [
             "cbu01.alicdn.com/img/ibank",
             "cbu01.alicdn.com/img",
@@ -877,9 +1079,6 @@ class Alibaba1688Parser(BaseParser):
     def _is_service_or_ui_context(self, text: str, url: str) -> bool:
         """
         根据 URL 附近上下文过滤服务图标 / UI 图标。
-
-        1688 的 7天、48小时、保障服务图标，有时 URL 本身也像商品图，
-        所以需要结合上下文判断。
         """
         if not text or not url:
             return False
@@ -974,6 +1173,49 @@ class Alibaba1688Parser(BaseParser):
 
         return False
 
+    def _is_detail_marketing_context(self, text: str, url: str) -> bool:
+        """
+        判断 URL 附近上下文是否像详情营销图。
+        主要用于 SKU / JSON 主图补充过滤，不用于左侧主图 DOM 过滤。
+        """
+        if not text or not url:
+            return False
+
+        lower_text = text.lower()
+        lower_url = url.lower()
+
+        pos = lower_text.find(lower_url)
+
+        if pos < 0:
+            ctx = lower_text[:1000]
+        else:
+            start = max(0, pos - 300)
+            end = min(len(lower_text), pos + len(lower_url) + 300)
+            ctx = lower_text[start:end]
+
+        bad_words = [
+            "detail",
+            "description",
+            "desc",
+            "richtext",
+            "rich-text",
+            "content",
+            "module",
+            "营销",
+            "详情",
+            "卖点",
+            "参数",
+            "banner",
+            "poster",
+            "海报",
+            "宣传",
+        ]
+
+        if any(w in ctx for w in bad_words):
+            return True
+
+        return False
+
     # ------------------------------------------------------------------
     # 解码 / 去重
     # ------------------------------------------------------------------
@@ -982,10 +1224,7 @@ class Alibaba1688Parser(BaseParser):
         """
         安全解码文本。
 
-        不能对整段 HTML 执行：
-            text.encode("utf-8").decode("unicode_escape")
-
-        否则正常中文会被解坏，出现 å¥³ 这种乱码。
+        不对整段 HTML 做 unicode_escape，避免中文变成乱码。
         """
         if not text:
             return ""
@@ -1000,7 +1239,6 @@ class Alibaba1688Parser(BaseParser):
         text = text.replace("\\u002f", "/")
         text = text.replace("&amp;", "&")
 
-        # 只替换标准 unicode 转义，不破坏正常中文
         def replace_unicode(match):
             try:
                 return chr(int(match.group(1), 16))
@@ -1037,22 +1275,13 @@ class Alibaba1688Parser(BaseParser):
     def _image_dedupe_key(self, url: str) -> str:
         """
         生成图片去重 key。
-
-        1688 同一张图经常有：
-            xxx.jpg
-            xxx.jpg_60x60.jpg
-            xxx.jpg_300x300.jpg
-            xxx.jpg_460x460q90.jpg
         """
         if not url:
             return ""
 
         u = url.lower().strip()
-
-        # 去查询参数
         u = u.split("?")[0]
 
-        # 去阿里图片缩略图后缀
         u = re.sub(
             r"(\.(?:jpg|jpeg|png|webp))_\d+x\d+(?:q\d+)?\.(?:jpg|jpeg|png|webp)$",
             r"\1",
@@ -1085,7 +1314,7 @@ class Alibaba1688Parser(BaseParser):
             "User-Agent": (
                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                 "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/126.0.0.0 Safari/537.36"
+                "Chrome/124.0.0.0 Safari/537.36"
             ),
             "Referer": "https://detail.1688.com/",
             "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
