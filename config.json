@@ -1,0 +1,15 @@
+{
+  "save_dir": "C:\\Users\\X\\Desktop\\product_image_collector\\output",
+  "download_main": true,
+  "download_detail": true,
+  "download_sku": true,
+  "high_quality": true,
+  "download_timeout": 20,
+  "download_retries": 3,
+  "headless": false,
+  "login_wait_seconds": 180,
+  "organize_by_date": true,
+  "organize_by_platform": true,
+  "dedupe_images": true,
+  "image_output_format": "png"
+}
