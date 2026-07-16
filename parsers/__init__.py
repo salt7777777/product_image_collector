@@ -1,6 +1,7 @@
 from parsers.jd import JDParser
 from parsers.taobao import TaobaoParser
 from parsers.pdd import PddParser
+from parsers.alibaba1688 import Alibaba1688Parser
 
 
 def get_parser(
@@ -28,6 +29,13 @@ def get_parser(
 
     if platform == "pdd":
         return PddParser(
+            log_callback=log_callback,
+            headless=headless,
+            login_wait_seconds=login_wait_seconds,
+        )
+
+    if platform == "1688":
+        return Alibaba1688Parser(
             log_callback=log_callback,
             headless=headless,
             login_wait_seconds=login_wait_seconds,

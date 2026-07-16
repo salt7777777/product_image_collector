@@ -75,6 +75,19 @@ class ConvertedImage:
 
 
 @dataclass
+class SmallImage:
+    """
+    小图过滤记录。
+    """
+
+    original_path: str
+    backup_path: str
+    width: int
+    height: int
+    reason: str
+
+
+@dataclass
 class DownloadResult:
     """
     下载结果统计。
@@ -94,6 +107,11 @@ class DownloadResult:
     converted_count: int = 0
     convert_failed: int = 0
     converted_items: list[ConvertedImage] = field(default_factory=list)
+
+    # 小图过滤统计
+    small_filtered_count: int = 0
+    small_filter_failed: int = 0
+    small_image_items: list[SmallImage] = field(default_factory=list)
 
     @property
     def success_rate(self) -> float:

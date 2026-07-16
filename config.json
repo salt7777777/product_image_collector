@@ -11,5 +11,8 @@
   "organize_by_date": true,
   "organize_by_platform": true,
   "dedupe_images": true,
-  "image_output_format": "png"
+  "image_output_format": "original",
+  "filter_small_images": true,
+  "min_image_width": 300,
+  "min_image_height": 300
 }

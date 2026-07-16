@@ -32,9 +32,12 @@ class AppConfig:
 
     dedupe_images: bool = False
 
-    # 图片输出格式：
-    # original / jpg / png / webp
     image_output_format: str = "original"
+
+    # 小图过滤
+    filter_small_images: bool = False
+    min_image_width: int = 300
+    min_image_height: int = 300
 
     @classmethod
     def load(cls) -> "AppConfig":

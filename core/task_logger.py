@@ -47,6 +47,10 @@ class TaskLogger:
         lines.append(f"成功率：{download_result.success_rate}%")
         lines.append("")
 
+        # ------------------------------------------------------------
+        # MD5 去重
+        # ------------------------------------------------------------
+
         lines.append("图片去重：")
         lines.append(f"处理重复图片：{download_result.duplicate_removed} 张")
         lines.append(f"释放空间：{TaskLogger._format_bytes(download_result.duplicate_removed_bytes)}")
@@ -64,6 +68,10 @@ class TaskLogger:
         else:
             lines.append("重复图片明细：无")
             lines.append("")
+
+        # ------------------------------------------------------------
+        # 格式转换
+        # ------------------------------------------------------------
 
         lines.append("图片格式转换：")
         lines.append(f"转换成功：{download_result.converted_count} 张")
@@ -86,6 +94,32 @@ class TaskLogger:
         else:
             lines.append("格式转换明细：无")
             lines.append("")
+
+        # ------------------------------------------------------------
+        # 小图过滤
+        # ------------------------------------------------------------
+
+        lines.append("小图过滤：")
+        lines.append(f"过滤数量：{download_result.small_filtered_count} 张")
+        lines.append(f"处理失败：{download_result.small_filter_failed} 张")
+        lines.append("")
+
+        if download_result.small_image_items:
+            lines.append("小图过滤明细：")
+            for index, item in enumerate(download_result.small_image_items, start=1):
+                lines.append(f"[{index}]")
+                lines.append(f"    原始文件：{item.original_path}")
+                lines.append(f"    备份文件：{item.backup_path}")
+                lines.append(f"    宽高：{item.width}x{item.height}")
+                lines.append(f"    原因：{item.reason}")
+            lines.append("")
+        else:
+            lines.append("小图过滤明细：无")
+            lines.append("")
+
+        # ------------------------------------------------------------
+        # 下载失败
+        # ------------------------------------------------------------
 
         if download_result.failed_items:
             lines.append("失败明细：")
@@ -153,6 +187,18 @@ class TaskLogger:
                     }
                     for item in download_result.converted_items
                 ],
+                "small_filtered_count": download_result.small_filtered_count,
+                "small_filter_failed": download_result.small_filter_failed,
+                "small_image_items": [
+                    {
+                        "original_path": item.original_path,
+                        "backup_path": item.backup_path,
+                        "width": item.width,
+                        "height": item.height,
+                        "reason": item.reason,
+                    }
+                    for item in download_result.small_image_items
+                ],
             },
         }
 
@@ -213,6 +259,8 @@ class TaskLogger:
         lines.append(f"释放空间：{TaskLogger._format_bytes(aggregate_result.duplicate_removed_bytes)}")
         lines.append(f"格式转换成功：{aggregate_result.converted_count} 张")
         lines.append(f"格式转换失败：{aggregate_result.convert_failed} 张")
+        lines.append(f"小图过滤：{aggregate_result.small_filtered_count} 张")
+        lines.append(f"小图过滤失败：{aggregate_result.small_filter_failed} 张")
         lines.append("")
         lines.append("=" * 60)
         lines.append("商品明细")
@@ -243,6 +291,8 @@ class TaskLogger:
             lines.append(f"        释放空间：{TaskLogger._format_bytes(result.duplicate_removed_bytes)}")
             lines.append(f"        格式转换成功：{result.converted_count} 张")
             lines.append(f"        格式转换失败：{result.convert_failed} 张")
+            lines.append(f"        小图过滤：{result.small_filtered_count} 张")
+            lines.append(f"        小图过滤失败：{result.small_filter_failed} 张")
             lines.append("")
 
         report_path.write_text("\n".join(lines), encoding="utf-8")
@@ -378,8 +428,42 @@ class TaskLogger:
                     failed_lines.append("")
                     item_index += 1
 
+        small_filter_count = 0
+
+        for batch_item in batch_items:
+            result = batch_item["download_result"]
+            small_filter_count += len(result.small_image_items)
+
+        if small_filter_count:
+            has_failed = True
+            failed_lines.append("五、小图过滤记录")
+            failed_lines.append("-" * 60)
+
+            item_index = 1
+
+            for batch_item in batch_items:
+                product = batch_item["product"]
+                result = batch_item["download_result"]
+
+                if not result.small_image_items:
+                    continue
+
+                failed_lines.append(f"商品：{product.title}")
+                failed_lines.append(f"平台：{product.platform}")
+                failed_lines.append(f"商品ID：{product.product_id}")
+                failed_lines.append(f"商品链接：{product.url}")
+
+                for item in result.small_image_items:
+                    failed_lines.append(f"    [{item_index}]")
+                    failed_lines.append(f"    原始文件：{item.original_path}")
+                    failed_lines.append(f"    备份文件：{item.backup_path}")
+                    failed_lines.append(f"    宽高：{item.width}x{item.height}")
+                    failed_lines.append(f"    原因：{item.reason}")
+                    failed_lines.append("")
+                    item_index += 1
+
         if not has_failed:
-            failed_lines.append("无失败链接、失败图片、重复图片或格式转换失败记录。")
+            failed_lines.append("无失败链接、失败图片、重复图片、格式转换失败或小图过滤记录。")
 
         failed_path.write_text("\n".join(failed_lines), encoding="utf-8")
 
@@ -425,12 +509,6 @@ class TaskLogger:
     ) -> None:
         """
         保存 Excel 批量报告。
-
-        Sheet:
-            1. 商品汇总
-            2. 失败明细
-            3. MD5去重记录
-            4. 格式转换记录
         """
 
         from openpyxl import Workbook
@@ -447,6 +525,7 @@ class TaskLogger:
         ws_failed = wb.create_sheet("失败明细")
         ws_duplicate = wb.create_sheet("MD5去重记录")
         ws_convert = wb.create_sheet("格式转换记录")
+        ws_small = wb.create_sheet("小图过滤记录")
 
         header_fill = PatternFill("solid", fgColor="1F4E78")
         header_font = Font(color="FFFFFF", bold=True)
@@ -480,6 +559,8 @@ class TaskLogger:
             "释放空间",
             "格式转换成功",
             "格式转换失败",
+            "小图过滤",
+            "小图过滤失败",
             "保存路径",
         ]
 
@@ -502,7 +583,8 @@ class TaskLogger:
                 f"成功率 {aggregate_result.success_rate}%，"
                 f"MD5去重处理 {aggregate_result.duplicate_removed} 张，"
                 f"格式转换成功 {aggregate_result.converted_count} 张，"
-                f"格式转换失败 {aggregate_result.convert_failed} 张"
+                f"格式转换失败 {aggregate_result.convert_failed} 张，"
+                f"小图过滤 {aggregate_result.small_filtered_count} 张"
             ]
         )
         ws_summary.append([])
@@ -532,6 +614,8 @@ class TaskLogger:
                     TaskLogger._format_bytes(result.duplicate_removed_bytes),
                     result.converted_count,
                     result.convert_failed,
+                    result.small_filtered_count,
+                    result.small_filter_failed,
                     str(product_dir),
                 ]
             )
@@ -752,11 +836,75 @@ class TaskLogger:
             border=border,
         )
 
+        # ------------------------------------------------------------
+        # Sheet5 小图过滤记录
+        # ------------------------------------------------------------
+
+        small_headers = [
+            "序号",
+            "商品标题",
+            "平台",
+            "商品ID",
+            "原始文件",
+            "备份文件",
+            "宽度",
+            "高度",
+            "原因",
+        ]
+
+        ws_small.append(small_headers)
+
+        small_index = 1
+
+        for batch_item in batch_items:
+            product = batch_item["product"]
+            result = batch_item["download_result"]
+
+            for item in result.small_image_items:
+                ws_small.append(
+                    [
+                        small_index,
+                        product.title,
+                        product.platform,
+                        product.product_id,
+                        item.original_path,
+                        item.backup_path,
+                        item.width,
+                        item.height,
+                        item.reason,
+                    ]
+                )
+                small_index += 1
+
+        if small_index == 1:
+            ws_small.append(
+                [
+                    1,
+                    "",
+                    "",
+                    "",
+                    "",
+                    "",
+                    "",
+                    "",
+                    "无小图过滤记录",
+                ]
+            )
+
+        TaskLogger._style_worksheet(
+            ws_small,
+            header_row=1,
+            header_fill=header_fill,
+            header_font=header_font,
+            border=border,
+        )
+
         # 冻结窗格
         ws_summary.freeze_panes = "A9"
         ws_failed.freeze_panes = "A2"
         ws_duplicate.freeze_panes = "A2"
         ws_convert.freeze_panes = "A2"
+        ws_small.freeze_panes = "A2"
 
         # 自动筛选
         if ws_summary.max_row >= 8:
@@ -764,20 +912,9 @@ class TaskLogger:
                 f"A8:{get_column_letter(ws_summary.max_column)}{ws_summary.max_row}"
             )
 
-        if ws_failed.max_row >= 1:
-            ws_failed.auto_filter.ref = (
-                f"A1:{get_column_letter(ws_failed.max_column)}{ws_failed.max_row}"
-            )
-
-        if ws_duplicate.max_row >= 1:
-            ws_duplicate.auto_filter.ref = (
-                f"A1:{get_column_letter(ws_duplicate.max_column)}{ws_duplicate.max_row}"
-            )
-
-        if ws_convert.max_row >= 1:
-            ws_convert.auto_filter.ref = (
-                f"A1:{get_column_letter(ws_convert.max_column)}{ws_convert.max_row}"
-            )
+        for ws in [ws_failed, ws_duplicate, ws_convert, ws_small]:
+            if ws.max_row >= 1:
+                ws.auto_filter.ref = f"A1:{get_column_letter(ws.max_column)}{ws.max_row}"
 
         wb.save(excel_path)
 

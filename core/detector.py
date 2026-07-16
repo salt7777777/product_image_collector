@@ -14,7 +14,7 @@ class PlatformDetector:
             platform, product_id
 
         platform:
-            jd / taobao / tmall / pdd / unknown
+            jd / taobao / tmall / pdd / 1688 / unknown
         """
         parsed = urlparse(url)
         host = parsed.netloc.lower()
@@ -36,6 +36,10 @@ class PlatformDetector:
             product_id = query.get("goods_id", [""])[0]
             return "pdd", product_id
 
+        if "1688.com" in host:
+            product_id = PlatformDetector._extract_1688_id(url)
+            return "1688", product_id
+
         return "unknown", ""
 
     @staticmethod
@@ -47,4 +51,24 @@ class PlatformDetector:
         match = re.search(r"/(\d+)\.html", url)
         if match:
             return match.group(1)
+        return ""
+
+    @staticmethod
+    def _extract_1688_id(url: str) -> str:
+        """
+        1688 常见链接：
+        https://detail.1688.com/offer/123456789.html
+        https://m.1688.com/offer/123456789.html
+        """
+        patterns = [
+            r"/offer/(\d+)\.html",
+            r"offerId=(\d+)",
+            r"offerid=(\d+)",
+        ]
+
+        for pattern in patterns:
+            match = re.search(pattern, url, flags=re.I)
+            if match:
+                return match.group(1)
+
         return ""
