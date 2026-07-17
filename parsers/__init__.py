@@ -12,7 +12,15 @@ def get_parser(
 ):
     """
     根据平台返回对应解析器。
+
+    登录状态目录规则：
+        browser_data/jd
+        browser_data/taobao
+        browser_data/tmall
+        browser_data/pdd
+        browser_data/1688
     """
+
     if platform == "jd":
         return JDParser(
             log_callback=log_callback,
@@ -22,6 +30,7 @@ def get_parser(
 
     if platform in ["taobao", "tmall"]:
         return TaobaoParser(
+            platform=platform,
             log_callback=log_callback,
             headless=headless,
             login_wait_seconds=login_wait_seconds,

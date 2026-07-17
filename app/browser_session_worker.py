@@ -11,7 +11,7 @@ class LoginBrowserWorker(QThread):
 
     用途：
     1. 单独打开浏览器登录页；
-    2. 使用 browser_data 保存登录状态；
+    2. 使用 browser_data/{platform} 保存各平台独立登录状态；
     3. 用户登录完成后关闭浏览器，或在主程序中点击“结束登录浏览器”；
     4. 不阻塞主界面。
     """
@@ -42,8 +42,22 @@ class LoginBrowserWorker(QThread):
         user_data_dir: str = "browser_data",
     ):
         super().__init__()
+
         self.platform = platform
-        self.user_data_dir = Path(user_data_dir)
+
+        base_dir = Path(user_data_dir)
+
+        # 兼容两种传法：
+        # 1. user_data_dir="browser_data"
+        #    => browser_data/{platform}
+        #
+        # 2. user_data_dir="browser_data/1688"
+        #    => browser_data/1688
+        if base_dir.name == platform:
+            self.user_data_dir = base_dir
+        else:
+            self.user_data_dir = base_dir / platform
+
         self._stop_requested = False
 
     def stop(self):
@@ -78,7 +92,7 @@ class LoginBrowserWorker(QThread):
 
         try:
             self.log_signal.emit(f"正在打开{platform_name}登录浏览器...")
-            self.log_signal.emit("登录状态将保存到 browser_data 目录。")
+            self.log_signal.emit(f"登录状态将保存到：{self.user_data_dir}")
 
             with sync_playwright() as p:
                 context = p.chromium.launch_persistent_context(

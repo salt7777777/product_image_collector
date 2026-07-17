@@ -42,18 +42,24 @@ class TaobaoParser(BaseParser):
 
     def __init__(
         self,
+        platform: str = "taobao",
         log_callback=None,
         headless: bool = False,
         login_wait_seconds: int = 180,
     ):
-       """
-       :param log_callback: 日志回调函数，用于把解析器内部日志输出到 UI。
-       """
-       self.browser = BrowserClient(
+        """
+        :param platform: taobao / tmall，用于隔离登录状态目录。
+        :param log_callback: 日志回调函数，用于把解析器内部日志输出到 UI。
+        """
+        profile_platform = platform if platform in ["taobao", "tmall"] else "taobao"
+
+        self.browser = BrowserClient(
+            user_data_dir=f"browser_data/{profile_platform}",
             headless=headless,
             login_wait_seconds=login_wait_seconds,
             log_callback=log_callback,
         )
+
 
 
     def parse(self, url: str) -> ProductData:

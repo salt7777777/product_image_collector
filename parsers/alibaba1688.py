@@ -17,11 +17,14 @@ class Alibaba1688Parser(BaseParser):
     1688 商品解析器。
 
     当前策略：
-    1. 商品标题：优先商品标题字段，避免取公司名/店铺名；
-    2. 主图：优先从页面左侧主图/缩略图 DOM 区域提取；
-    3. 详情图：优先 descUrl 接口，兜底只取详情相关字段；
-    4. SKU 图：从 SKU DOM / background-image / SKU JSON 中提取；
-    5. 过滤服务图标、7天、48小时、店铺图标、UI 图标等。
+    1. 标题：使用已验证较准确的标题解析逻辑；
+    2. 主图：优先从 Playwright 渲染后的 DOM 中提取左侧缩略图；
+    3. 主图不采集 background-image，避免播放/旋转/放大/参数等 UI 图标混入；
+    4. SKU 图：优先从 Playwright 渲染后的 DOM 中提取规格区域图片；
+    5. SKU 区域允许 background-image，因为 SKU 小图可能是背景图；
+    6. 详情图：优先 descUrl/detailUrl 接口；
+    7. 详情图兜底只使用严格详情字段，避免把主图误识别为详情图；
+    8. 修复详情接口请求头中文导致的 ascii 编码错误。
     """
 
     def __init__(
@@ -32,16 +35,29 @@ class Alibaba1688Parser(BaseParser):
     ):
         self.log_callback = log_callback
         self.browser = BrowserClient(
+            user_data_dir="browser_data/1688",
             headless=headless,
             login_wait_seconds=login_wait_seconds,
             log_callback=log_callback,
         )
 
+
     def parse(self, url: str) -> ProductData:
         platform, product_id = PlatformDetector.detect(url)
 
+        rendered_data = {}
+
         self._log("正在打开 1688 商品页面...")
-        html = self.browser.open_page(url)
+
+        if hasattr(self.browser, "open_page_with_extracted_data"):
+            result = self.browser.open_page_with_extracted_data(
+                url,
+                self._build_1688_extract_script(),
+            )
+            html = result.get("html", "") or ""
+            rendered_data = result.get("data", {}) or {}
+        else:
+            html = self.browser.open_page(url)
 
         try:
             soup = BeautifulSoup(html, "lxml")
@@ -53,33 +69,43 @@ class Alibaba1688Parser(BaseParser):
             title = f"1688商品_{product_id or 'unknown'}"
 
         self._log("正在解析 1688 主图...")
+        rendered_main_urls = rendered_data.get("mainImages", []) or []
+        main_urls = self._normalize_urls(rendered_main_urls)
+        self._log(f"1688渲染DOM主图候选：{len(main_urls)} 张")
 
-        # 主图候选集：用于后面从详情图中排除主图。
-        # 注意：这里直接从 DOM 拿一份候选，不代表最终主图全部使用这些。
-        main_gallery_candidates = self._parse_main_images_from_dom(soup)
-        main_urls = self._parse_main_image_urls(html, soup)
+        if not main_urls:
+            main_urls = self._parse_main_image_urls(html, soup)
 
         self._log("正在解析 1688 SKU 图...")
-        sku_urls = self._parse_sku_image_urls(html, soup)
+        rendered_sku_urls = rendered_data.get("skuImages", []) or []
+        sku_urls = self._normalize_urls(rendered_sku_urls)
+        self._log(f"1688渲染DOM SKU候选：{len(sku_urls)} 张")
+
+        if not sku_urls:
+            sku_urls = self._parse_sku_image_urls(html, soup)
 
         self._log("正在解析 1688 详情图...")
-        detail_urls = self._parse_detail_image_urls(html, url)
+        raw_detail_urls = self._parse_detail_image_urls(html, url)
 
-        # 规范化 + 去重
+        # 如果渲染后的 HTML 没识别到详情图，则用原始 open_page() 重试一次。
+        # 注意：重试仍然使用严格详情图规则，不再宽泛扫整页图片。
+        if not raw_detail_urls:
+            self._log("1688详情图为空，尝试使用原始页面方式重新提取详情图...")
+
+            try:
+                fallback_html = self.browser.open_page(url)
+                raw_detail_urls = self._parse_detail_image_urls(fallback_html, url)
+            except Exception as e:
+                self._log(f"1688详情图重试提取失败：{e}")
+
         main_urls = self._dedupe_keep_order(main_urls)
         sku_urls = self._dedupe_keep_order(sku_urls)
-        detail_urls = self._dedupe_keep_order(detail_urls)
+        detail_urls = self._dedupe_keep_order(raw_detail_urls)
 
-        # 详情图排除主图与 SKU 图。
-        # 这里不仅排除最终 main_urls，也排除 main_gallery_candidates，
-        # 避免左侧主图缩略图被详情图兜底逻辑再次收进去。
-        main_exclude_urls = []
-        main_exclude_urls.extend(main_urls)
-        main_exclude_urls.extend(main_gallery_candidates)
-
-        main_set = set(self._image_dedupe_key(u) for u in main_exclude_urls)
+        main_set = set(self._image_dedupe_key(u) for u in main_urls)
         sku_set = set(self._image_dedupe_key(u) for u in sku_urls)
 
+        # 详情图排除主图和 SKU 图，避免主图/主图不同尺寸混入详情图。
         detail_urls = [
             u for u in detail_urls
             if self._image_dedupe_key(u) not in main_set
@@ -87,9 +113,9 @@ class Alibaba1688Parser(BaseParser):
         ]
 
         # 不从主图里排除 SKU 图。
-        # 1688 很多商品 SKU 图本身就是主图之一。
+        # 1688 很多 SKU 图就是主图区域中的一张图。
 
-        main_urls = main_urls[:8]
+        main_urls = main_urls[:12]
         detail_urls = detail_urls[:120]
         sku_urls = sku_urls[:40]
 
@@ -113,17 +139,479 @@ class Alibaba1688Parser(BaseParser):
         )
 
     # ------------------------------------------------------------------
+    # Playwright DOM 提取脚本
+    # ------------------------------------------------------------------
+
+    def _build_1688_extract_script(self) -> str:
+        """
+        在 Playwright 渲染后的页面中执行 JS，直接提取：
+        1. 左侧主图区域图片；
+        2. SKU 规格区域图片。
+
+        注意：
+            主图区域不采集 background-image；
+            SKU 区域允许采集 background-image。
+        """
+
+        return r"""
+        () => {
+            const result = {
+                mainImages: [],
+                skuImages: []
+            };
+
+            function normalizeUrl(url) {
+                if (!url) return '';
+
+                url = String(url).trim();
+
+                if (!url) return '';
+
+                if (url.startsWith('//')) {
+                    url = 'https:' + url;
+                }
+
+                if (!/^https?:\/\//i.test(url)) return '';
+
+                url = url.replace(/&amp;/g, '&');
+
+                return url;
+            }
+
+            function isImageUrl(url) {
+                return /\.(jpg|jpeg|png|webp)(\?|_|$)/i.test(url || '');
+            }
+
+            function imageKey(url) {
+                let u = String(url || '').toLowerCase().trim();
+
+                u = u.split('?')[0];
+                u = u.replace(/^https?:\/\//, '');
+
+                u = u.replace(/(\.(jpg|jpeg|png|webp))_\d+x\d+(q\d+)?\.(jpg|jpeg|png|webp)$/i, '$1');
+                u = u.replace(/(\.(jpg|jpeg|png|webp))_\d+x\d+(q\d+)?$/i, '$1');
+                u = u.replace(/(\.(jpg|jpeg|png|webp))_\d+x\d+.*$/i, '$1');
+                u = u.replace(/(\.(jpg|jpeg|png|webp))_\.(webp|jpg|jpeg|png)$/i, '$1');
+
+                return u;
+            }
+
+            function isBadUrl(url) {
+                const u = String(url || '').toLowerCase();
+
+                const badWords = [
+                    'icon',
+                    'logo',
+                    'avatar',
+                    'qrcode',
+                    'qr_code',
+                    'loading',
+                    'placeholder',
+                    'default',
+                    'sprite',
+                    'button',
+                    'btn',
+                    'play',
+                    'video',
+                    'rotate',
+                    'rotation',
+                    'zoom',
+                    'expand',
+                    'param',
+                    'parameter',
+                    'collect',
+                    'favorite',
+                    'share',
+                    'service',
+                    'guarantee',
+                    'credit',
+                    'member',
+                    'shop',
+                    'seller',
+                    'wangwang',
+                    'aliww',
+                    'favicon',
+                    'transparent',
+                    'blank',
+                    'empty',
+                    'arrow',
+                    'close',
+                    'search',
+                    'cart',
+                    'login',
+                    'coupon',
+                    'discount',
+                    'activity',
+                    'promotion',
+                    'insurance',
+                    'promise',
+                    'protect',
+                    'certificate',
+                    'license',
+                    'company',
+                    'store',
+                    'factory',
+                    'supplier',
+                    'return',
+                    'refund',
+                    '7day',
+                    '48h',
+                    '48hour'
+                ];
+
+                if (badWords.some(w => u.includes(w))) return true;
+
+                const smallPatterns = [
+                    '12x12',
+                    '16x16',
+                    '20x20',
+                    '24x24',
+                    '30x30',
+                    '32x32',
+                    '36x36',
+                    '40x40',
+                    '48x48',
+                    '50x50',
+                    '60x60',
+                    '64x64',
+                    '70x70',
+                    '72x72',
+                    '80x80',
+                    '88x88',
+                    '90x90',
+                    '100x100',
+                    '110x110',
+                    '120x120'
+                ];
+
+                if (smallPatterns.some(p => u.includes(p))) return true;
+
+                return false;
+            }
+
+            function addUrl(list, url) {
+                url = normalizeUrl(url);
+
+                if (!url) return;
+                if (!isImageUrl(url)) return;
+                if (isBadUrl(url)) return;
+
+                if (!/alicdn\.com|1688\.com/i.test(url)) return;
+
+                const key = imageKey(url);
+                const exists = list.some(item => imageKey(item) === key);
+
+                if (!exists) {
+                    list.push(url);
+                }
+            }
+
+            function collectUrlsFromElement(el, list, options = {}) {
+                if (!el) return;
+
+                const allowBackground = !!options.allowBackground;
+                const minRenderedSize = options.minRenderedSize || 40;
+
+                const attrs = [
+                    'src',
+                    'data-src',
+                    'data-original',
+                    'data-lazy-src',
+                    'data-img',
+                    'data-url',
+                    'data-lazyload'
+                ];
+
+                // img 标签
+                el.querySelectorAll('img').forEach(img => {
+                    const rect = img.getBoundingClientRect();
+
+                    if (rect.width && rect.height) {
+                        if (rect.width < minRenderedSize || rect.height < minRenderedSize) {
+                            return;
+                        }
+                    }
+
+                    const imgClass = (img.className || '').toString().toLowerCase();
+                    const imgAlt = (img.getAttribute('alt') || '').toLowerCase();
+                    const imgTitle = (img.getAttribute('title') || '').toLowerCase();
+                    const imgText = imgClass + ' ' + imgAlt + ' ' + imgTitle;
+
+                    const badImgWords = [
+                        'icon',
+                        'logo',
+                        'button',
+                        'btn',
+                        'play',
+                        'video-icon',
+                        'close',
+                        'arrow',
+                        'expand',
+                        'zoom',
+                        'rotate',
+                        'param',
+                        'parameter',
+                        '播放',
+                        '视频',
+                        '旋转',
+                        '放大',
+                        '参数'
+                    ];
+
+                    if (badImgWords.some(w => imgText.includes(w))) {
+                        return;
+                    }
+
+                    attrs.forEach(attr => {
+                        addUrl(list, img.getAttribute(attr));
+                    });
+
+                    const srcset = img.getAttribute('srcset') || img.getAttribute('data-srcset');
+                    if (srcset) {
+                        srcset.split(',').forEach(part => {
+                            const url = part.trim().split(/\s+/)[0];
+                            addUrl(list, url);
+                        });
+                    }
+                });
+
+                // source 标签
+                el.querySelectorAll('source').forEach(source => {
+                    const srcset = source.getAttribute('srcset') || source.getAttribute('data-srcset');
+                    if (srcset) {
+                        srcset.split(',').forEach(part => {
+                            const url = part.trim().split(/\s+/)[0];
+                            addUrl(list, url);
+                        });
+                    }
+                });
+
+                // 主图区域默认不采集 background-image。
+                // SKU 区域通过 allowBackground=true 开启。
+                if (!allowBackground) {
+                    return;
+                }
+
+                const all = el.querySelectorAll('*');
+
+                all.forEach(node => {
+                    const rect = node.getBoundingClientRect();
+
+                    if (rect.width && rect.height) {
+                        if (rect.width < minRenderedSize || rect.height < minRenderedSize) {
+                            return;
+                        }
+                    }
+
+                    const cls = (node.className || '').toString().toLowerCase();
+                    const text = (node.innerText || '').toLowerCase();
+                    const title = (node.getAttribute('title') || '').toLowerCase();
+                    const aria = (node.getAttribute('aria-label') || '').toLowerCase();
+
+                    const nodeText = cls + ' ' + text + ' ' + title + ' ' + aria;
+
+                    const badNodeWords = [
+                        'icon',
+                        'logo',
+                        'button',
+                        'btn',
+                        'play',
+                        'video',
+                        'close',
+                        'arrow',
+                        'expand',
+                        'zoom',
+                        'rotate',
+                        'param',
+                        'parameter',
+                        '宝贝',
+                        '参数',
+                        '播放',
+                        '视频',
+                        '旋转',
+                        '放大'
+                    ];
+
+                    if (badNodeWords.some(w => nodeText.includes(w))) {
+                        return;
+                    }
+
+                    const inlineStyle = node.getAttribute('style') || '';
+                    const inlineMatches = inlineStyle.match(/url\(["']?([^"')]+)["']?\)/ig);
+
+                    if (inlineMatches) {
+                        inlineMatches.forEach(m => {
+                            const mm = m.match(/url\(["']?([^"')]+)["']?\)/i);
+                            if (mm && mm[1]) {
+                                addUrl(list, mm[1]);
+                            }
+                        });
+                    }
+
+                    try {
+                        const style = window.getComputedStyle(node);
+                        const bg = style && style.backgroundImage ? style.backgroundImage : '';
+
+                        if (bg && bg !== 'none') {
+                            const matches = bg.match(/url\(["']?([^"')]+)["']?\)/ig);
+                            if (matches) {
+                                matches.forEach(m => {
+                                    const mm = m.match(/url\(["']?([^"')]+)["']?\)/i);
+                                    if (mm && mm[1]) {
+                                        addUrl(list, mm[1]);
+                                    }
+                                });
+                            }
+                        }
+                    } catch (e) {}
+                });
+            }
+
+            function collectNearLeftGallery() {
+                const selectors = [
+                    '[class*="detail-gallery"]',
+                    '[class*="gallery"]',
+                    '[class*="album"]',
+                    '[class*="main-image"]',
+                    '[class*="mainImage"]',
+                    '[class*="image-list"]',
+                    '[class*="imageList"]',
+                    '[class*="preview"]',
+                    '[class*="magnifier"]',
+                    '[class*="vertical-img"]',
+                    '[class*="verticalImg"]',
+                    '[class*="thumb"]',
+                    '[class*="thumbnail"]'
+                ];
+
+                const candidates = [];
+
+                selectors.forEach(selector => {
+                    document.querySelectorAll(selector).forEach(el => {
+                        const rect = el.getBoundingClientRect();
+                        const text = (el.innerText || '').toLowerCase();
+                        const cls = (el.className || '').toString().toLowerCase();
+                        const html = (el.outerHTML || '').slice(0, 1000).toLowerCase();
+                        const area = text + ' ' + cls + ' ' + html;
+
+                        if (rect.width < 30 || rect.height < 30) return;
+
+                        const badArea = [
+                            'description',
+                            'detail-content',
+                            'rich-text',
+                            'shop',
+                            'seller',
+                            'company',
+                            'service',
+                            'guarantee'
+                        ];
+
+                        const goodArea = [
+                            'gallery',
+                            'album',
+                            'main-image',
+                            'mainimage',
+                            'preview',
+                            'magnifier',
+                            'thumb',
+                            'thumbnail',
+                            'image-list',
+                            'imagelist',
+                            'vertical'
+                        ];
+
+                        if (badArea.some(w => area.includes(w)) && !goodArea.some(w => area.includes(w))) {
+                            return;
+                        }
+
+                        candidates.push({
+                            el,
+                            top: rect.top,
+                            left: rect.left,
+                            width: rect.width,
+                            height: rect.height
+                        });
+                    });
+                });
+
+                candidates.sort((a, b) => {
+                    if (Math.abs(a.top - b.top) > 50) return a.top - b.top;
+                    return a.left - b.left;
+                });
+
+                candidates.slice(0, 25).forEach(item => {
+                    collectUrlsFromElement(item.el, result.mainImages, {
+                        allowBackground: false,
+                        minRenderedSize: 45
+                    });
+                });
+            }
+
+            function collectSkuArea() {
+                const selectors = [
+                    '[class*="sku"]',
+                    '[class*="Sku"]',
+                    '[class*="sale-prop"]',
+                    '[class*="saleProp"]',
+                    '[class*="prop-item"]',
+                    '[class*="propItem"]',
+                    '[class*="spec"]',
+                    '[class*="model"]',
+                    '[class*="attribute"]',
+                    '[class*="offer-attr"]'
+                ];
+
+                const candidates = [];
+
+                selectors.forEach(selector => {
+                    document.querySelectorAll(selector).forEach(el => {
+                        const text = (el.innerText || '').toLowerCase();
+                        const html = (el.outerHTML || '').toLowerCase();
+                        const combined = text + ' ' + html;
+
+                        const looksLikeSku =
+                            combined.includes('sku') ||
+                            combined.includes('规格') ||
+                            combined.includes('型号') ||
+                            combined.includes('颜色') ||
+                            combined.includes('尺寸') ||
+                            combined.includes('款式') ||
+                            combined.includes('类型') ||
+                            combined.includes('model') ||
+                            combined.includes('spec') ||
+                            combined.includes('prop') ||
+                            /\b[a-z]\d{1,3}\b/i.test(combined);
+
+                        if (!looksLikeSku) return;
+
+                        candidates.push(el);
+                    });
+                });
+
+                candidates.slice(0, 60).forEach(el => {
+                    collectUrlsFromElement(el, result.skuImages, {
+                        allowBackground: true,
+                        minRenderedSize: 35
+                    });
+                });
+            }
+
+            collectNearLeftGallery();
+            collectSkuArea();
+
+            result.mainImages = result.mainImages.slice(0, 12);
+            result.skuImages = result.skuImages.slice(0, 40);
+
+            return result;
+        }
+        """
+
+    # ------------------------------------------------------------------
     # 标题解析
     # ------------------------------------------------------------------
 
     def _parse_title(self, soup: BeautifulSoup, html: str) -> str:
-        """
-        解析商品标题。
-
-        1688 页面里经常有 companyName / shopName / sellerName，
-        这些不是商品标题，需要排除。
-        """
-
         meta_selectors = [
             ("meta", {"property": "og:title"}),
             ("meta", {"name": "og:title"}),
@@ -271,35 +759,14 @@ class Alibaba1688Parser(BaseParser):
         return True
 
     # ------------------------------------------------------------------
-    # 主图解析
+    # 主图兜底解析
     # ------------------------------------------------------------------
 
     def _parse_main_image_urls(self, html: str, soup: BeautifulSoup) -> list[str]:
-        """
-        解析 1688 主图。
-
-        优先采集页面左侧缩略图区域。
-
-        注意：
-            1688 左侧主图本身可能包含营销风格图，
-            例如快充图、新品图、功能图。
-            只要它出现在左侧主图缩略图区域，就应该算主图。
-        """
         urls: list[str] = []
 
-        # 1. 优先 DOM 主图区域
-        dom_urls = self._parse_main_images_from_dom(soup)
+        urls.extend(self._parse_main_images_from_dom(soup))
 
-        if dom_urls:
-            dom_urls = self._normalize_urls(dom_urls)
-            dom_urls = [
-                u for u in dom_urls
-                if self._is_likely_product_image(u, image_type="main")
-            ]
-            dom_urls = self._dedupe_keep_order(dom_urls)
-            urls.extend(dom_urls)
-
-        # 2. 如果 DOM 主图不足，再从严格 JSON 字段补充
         if len(urls) < 6:
             text = self._decode_text(html)
 
@@ -320,7 +787,7 @@ class Alibaba1688Parser(BaseParser):
                     block_urls = self._extract_image_urls_from_text(block)
 
                     for u in block_urls:
-                        if not self._is_likely_product_image(u, image_type="main"):
+                        if not self._is_likely_product_image(u):
                             continue
 
                         if self._is_service_or_ui_context(block, u):
@@ -329,23 +796,18 @@ class Alibaba1688Parser(BaseParser):
                         urls.append(u)
 
         urls = self._normalize_urls(urls)
-
-        urls = [
-            u for u in urls
-            if self._is_likely_product_image(u, image_type="main")
-        ]
-
+        urls = [u for u in urls if self._is_likely_product_image(u)]
         urls = self._dedupe_keep_order(urls)
 
-        # 1688 左侧主图一般 5~8 张，包含视频封面/参数图时可能更多。
-        return urls[:8]
+        return urls[:12]
 
     def _parse_main_images_from_dom(self, soup: BeautifulSoup) -> list[str]:
         """
-        从页面左侧主图/缩略图 DOM 区域提取主图。
+        静态 HTML 兜底提取主图。
 
-        这里不要过滤所谓“营销图”，因为 1688 左侧主图区域本身
-        经常包含营销风格主图。
+        注意：
+            主图区域不提取 background-image，
+            避免播放、旋转、放大、参数等 UI 图标混入。
         """
         urls: list[str] = []
 
@@ -371,12 +833,10 @@ class Alibaba1688Parser(BaseParser):
             except Exception:
                 nodes = []
 
-            for node in nodes[:15]:
+            for node in nodes[:20]:
                 node_text = str(node)
                 lower_node_text = node_text.lower()
 
-                # 排除明显详情/店铺/服务区域。
-                # 但如果同时明显是主图容器，不排除。
                 if any(k in lower_node_text for k in [
                     "description",
                     "detail-content",
@@ -401,19 +861,7 @@ class Alibaba1688Parser(BaseParser):
                     ]):
                         continue
 
-                # 1. img 标签
                 for img in node.find_all("img"):
-                    width = img.get("width") or ""
-                    height = img.get("height") or ""
-
-                    try:
-                        w = int(re.sub(r"\D", "", str(width)) or "0")
-                        h = int(re.sub(r"\D", "", str(height)) or "0")
-                        if w and h and (w < 35 or h < 35):
-                            continue
-                    except Exception:
-                        pass
-
                     for attr in [
                         "src",
                         "data-src",
@@ -424,45 +872,30 @@ class Alibaba1688Parser(BaseParser):
                         "data-lazyload",
                     ]:
                         value = img.get(attr)
-                        if not value:
-                            continue
+                        if value:
+                            urls.append(value)
 
-                        if self._is_service_or_ui_context(node_text, value):
-                            continue
+                    srcset = img.get("srcset") or img.get("data-srcset")
+                    if srcset:
+                        for part in srcset.split(","):
+                            value = part.strip().split(" ")[0]
+                            if value:
+                                urls.append(value)
 
-                        urls.append(value)
-
-                # 2. background-image，部分主图缩略图可能是背景图
-                style_urls = self._extract_background_image_urls(node_text)
-                for value in style_urls:
-                    if not value:
-                        continue
-
-                    if self._is_service_or_ui_context(node_text, value):
-                        continue
-
-                    urls.append(value)
+                # 主图区域不采集 background-image。
+                # 这些背景图大多是播放按钮、旋转按钮、放大图标、参数按钮等 UI。
+                # urls.extend(self._extract_background_image_urls(node_text))
 
         return urls
 
     # ------------------------------------------------------------------
-    # SKU 图解析
+    # SKU 兜底解析
     # ------------------------------------------------------------------
 
     def _parse_sku_image_urls(self, html: str, soup: BeautifulSoup) -> list[str]:
-        """
-        解析 1688 SKU 图。
-
-        当前策略：
-        1. 优先从页面 SKU DOM 区域提取；
-        2. 支持 background-image；
-        3. 再从 SKU JSON 字段兜底。
-        """
         urls: list[str] = []
 
-        dom_urls = self._parse_sku_images_from_dom(soup)
-        if dom_urls:
-            urls.extend(dom_urls)
+        urls.extend(self._parse_sku_images_from_dom(soup))
 
         text = self._decode_text(html)
 
@@ -486,7 +919,7 @@ class Alibaba1688Parser(BaseParser):
                 block_urls = self._extract_image_urls_from_text(block)
 
                 for u in block_urls:
-                    if not self._is_likely_product_image(u, image_type="sku"):
+                    if not self._is_likely_product_image(u):
                         continue
 
                     if self._is_service_or_ui_context(block, u):
@@ -498,22 +931,18 @@ class Alibaba1688Parser(BaseParser):
                     urls.append(u)
 
         urls = self._normalize_urls(urls)
-        urls = [
-            u for u in urls
-            if self._is_likely_product_image(u, image_type="sku")
-        ]
+        urls = [u for u in urls if self._is_likely_product_image(u)]
         urls = self._dedupe_keep_order(urls)
 
         return urls[:40]
 
     def _parse_sku_images_from_dom(self, soup: BeautifulSoup) -> list[str]:
         """
-        从页面 SKU 区域提取 SKU 图。
+        SKU 区域兜底提取。
 
-        兼容：
-        1. img 标签；
-        2. background-image 背景图；
-        3. 型号 C4 这类单规格商品。
+        注意：
+            SKU 区域允许 background-image，
+            因为 SKU 小图有时就是背景图。
         """
         urls: list[str] = []
 
@@ -536,28 +965,15 @@ class Alibaba1688Parser(BaseParser):
             except Exception:
                 nodes = []
 
-            for node in nodes[:50]:
+            for node in nodes[:60]:
                 node_text = str(node)
                 plain_text = node.get_text(" ", strip=True)
 
                 if not self._looks_like_sku_node(plain_text, node_text):
                     continue
 
-                # 1. 提取 background-image
-                style_urls = self._extract_background_image_urls(node_text)
-                for value in style_urls:
-                    if not value:
-                        continue
+                urls.extend(self._extract_background_image_urls(node_text))
 
-                    if self._is_service_or_ui_context(node_text, value):
-                        continue
-
-                    if self._is_detail_marketing_context(node_text, value):
-                        continue
-
-                    urls.append(value)
-
-                # 2. 提取 img
                 for img in node.find_all("img"):
                     for attr in [
                         "src",
@@ -569,23 +985,19 @@ class Alibaba1688Parser(BaseParser):
                         "data-lazyload",
                     ]:
                         value = img.get(attr)
-                        if not value:
-                            continue
+                        if value:
+                            urls.append(value)
 
-                        if self._is_service_or_ui_context(node_text, value):
-                            continue
-
-                        if self._is_detail_marketing_context(node_text, value):
-                            continue
-
-                        urls.append(value)
+                    srcset = img.get("srcset") or img.get("data-srcset")
+                    if srcset:
+                        for part in srcset.split(","):
+                            value = part.strip().split(" ")[0]
+                            if value:
+                                urls.append(value)
 
         return urls
 
     def _looks_like_sku_node(self, plain_text: str, html_text: str) -> bool:
-        """
-        判断 DOM 节点是否像 SKU 区域。
-        """
         text = f"{plain_text} {html_text}".lower()
 
         good_words = [
@@ -607,7 +1019,6 @@ class Alibaba1688Parser(BaseParser):
         if any(w in text for w in good_words):
             return True
 
-        # 识别类似 C4、A1、X10 这种短型号
         if re.search(r"\b[a-z]\d{1,3}\b", text, re.I):
             return True
 
@@ -621,18 +1032,23 @@ class Alibaba1688Parser(BaseParser):
         """
         解析详情图。
 
-        优先请求 descUrl 接口。
-        如果 descUrl 不存在，再从严格详情相关 JSON 块里提取。
-
-        注意：
-            不再使用 description / offerDetail / productDetail 等过宽字段，
-            避免把主图、SKU 图混进详情图。
+        策略：
+        1. 优先请求 descUrl/detailUrl；
+        2. descUrl 返回内容中直接提取详情图片；
+        3. 只有 descUrl 完全失败时，才使用严格详情字段兜底；
+        4. 不使用 description/content/offerDetail/productDetail 等宽字段扫整页。
         """
         text = self._decode_text(html)
 
         urls: list[str] = []
 
+        # ------------------------------------------------------------
+        # 1. 优先 descUrl / detailUrl 接口
+        # ------------------------------------------------------------
         desc_urls = self._extract_desc_urls(text, page_url)
+
+        if not desc_urls:
+            self._log("1688未找到有效详情接口 descUrl。")
 
         for desc_url in desc_urls:
             self._log(f"尝试请求 1688 详情接口：{desc_url}")
@@ -644,28 +1060,38 @@ class Alibaba1688Parser(BaseParser):
                 continue
 
             if not detail_html:
+                self._log("1688详情接口返回为空。")
                 continue
 
+            self._log(f"1688详情接口返回长度：{len(detail_html)}")
+
             detail_urls = self._extract_detail_images_from_desc_html(detail_html)
+
+            self._log(f"1688详情接口提取图片：{len(detail_urls)} 张")
+
             urls.extend(detail_urls)
 
-        # 兜底只保留严格详情字段，避免详情图数量异常增多。
+        # ------------------------------------------------------------
+        # 2. 如果 descUrl 没拿到图片，再用严格字段兜底
+        # ------------------------------------------------------------
         if not urls:
-            detail_keys = [
+            strict_detail_keys = [
                 "detailContent",
                 "detailImages",
                 "detail_images",
                 "richText",
+                "rich_text",
             ]
 
-            for key in detail_keys:
-                for block in self._extract_json_like_blocks_by_key(text, key, max_len=30000):
+            for key in strict_detail_keys:
+                for block in self._extract_json_like_blocks_by_key(text, key, max_len=40000):
                     block_urls = self._extract_image_urls_from_text(block)
 
                     for u in block_urls:
-                        if not self._is_likely_product_image(u, image_type="detail"):
+                        if not self._is_likely_product_image(u):
                             continue
 
+                        # 详情图只过滤明显 UI/服务图，不过滤营销图/参数图
                         if self._is_service_or_ui_context(block, u):
                             continue
 
@@ -674,13 +1100,24 @@ class Alibaba1688Parser(BaseParser):
         urls = self._normalize_urls(urls)
         urls = [
             u for u in urls
-            if self._is_likely_product_image(u, image_type="detail")
+            if self._is_likely_product_image(u)
         ]
         urls = self._dedupe_keep_order(urls)
 
         return urls[:120]
 
+
     def _extract_desc_urls(self, text: str, page_url: str) -> list[str]:
+        """
+        提取 1688 详情接口 URL。
+
+        只保留真正可能返回商品详情 HTML/图片的接口。
+        过滤：
+            - 金融授信页
+            - air.1688.com
+            - credit-buy
+            - 非详情接口
+        """
         urls = []
 
         patterns = [
@@ -688,6 +1125,7 @@ class Alibaba1688Parser(BaseParser):
             r"'descUrl'\s*:\s*'([^']+)'",
             r'"detailUrl"\s*:\s*"([^"]+)"',
             r"'detailUrl'\s*:\s*'([^']+)'",
+            r'((?:https?:)?//itemcdn\.tmall\.com/1688offer/[^"\']+)',
             r'((?:https?:)?//[^"\']+/offer/desc/[^"\']+)',
             r'((?:https?:)?//[^"\']+desc[^"\']+offer[^"\']+)',
         ]
@@ -709,40 +1147,111 @@ class Alibaba1688Parser(BaseParser):
                 elif raw.startswith("/"):
                     raw = urljoin(page_url, raw)
 
-                if raw.startswith("http") and raw not in urls:
+                if not raw.startswith("http"):
+                    continue
+
+                lower = raw.lower()
+
+                # --------------------------------------------------------
+                # 过滤明显不是商品详情图接口的 URL
+                # --------------------------------------------------------
+                bad_words = [
+                    "air.1688.com",
+                    "credit-buy",
+                    "scene_quota",
+                    "finance",
+                    "login",
+                    "member",
+                    "passport",
+                    "cart",
+                    "trade",
+                    "order",
+                    "pay",
+                ]
+
+                if any(w in lower for w in bad_words):
+                    continue
+
+                # --------------------------------------------------------
+                # 只保留真正像详情接口的 URL
+                # --------------------------------------------------------
+                good_words = [
+                    "itemcdn.tmall.com/1688offer",
+                    "/offer/desc/",
+                    "desc",
+                ]
+
+                if not any(w in lower for w in good_words):
+                    continue
+
+                if raw not in urls:
                     urls.append(raw)
 
         return urls[:5]
 
+
     def _extract_detail_images_from_desc_html(self, detail_html: str) -> list[str]:
+        """
+        从 1688 descUrl 接口返回内容中提取详情图。
+
+        兼容格式：
+            1. 直接 HTML
+            2. JSON/JSONP: {"content": "..."}
+            3. JS 变量：var offer_details = ...
+            4. 转义 HTML 字符串
+            5. 全文本中直接包含图片 URL
+        """
         text = self._decode_text(detail_html)
 
         content_candidates = []
 
+        # ------------------------------------------------------------
+        # 1. 尝试提取 content/desc/detailContent 字段
+        # ------------------------------------------------------------
         patterns = [
             r'"content"\s*:\s*"(.+?)"\s*(?:,\s*"|\})',
             r"'content'\s*:\s*'(.+?)'\s*(?:,\s*'|\})",
             r'"desc"\s*:\s*"(.+?)"\s*(?:,\s*"|\})',
             r"'desc'\s*:\s*'(.+?)'\s*(?:,\s*'|\})",
+            r'"offerDetail"\s*:\s*"(.+?)"\s*(?:,\s*"|\})',
+            r'"detailContent"\s*:\s*"(.+?)"\s*(?:,\s*"|\})',
+            r'"detail"\s*:\s*"(.+?)"\s*(?:,\s*"|\})',
         ]
 
         for pattern in patterns:
             for m in re.finditer(pattern, text, re.S):
-                content_candidates.append(m.group(1))
+                value = m.group(1)
+                if value:
+                    content_candidates.append(value)
 
-        if not content_candidates:
-            content_candidates.append(text)
+        # ------------------------------------------------------------
+        # 2. 重要：无论是否提取到 content 字段，都加入完整返回体兜底
+        #
+        # 有些 1688 desc 接口 content 字段很长，简单正则可能截断。
+        # 如果只解析截断后的 content，就会出现“接口请求成功但详情图为 0”。
+        # ------------------------------------------------------------
+        content_candidates.append(text)
 
         urls = []
 
         for content in content_candidates:
             content = self._decode_text(content)
 
+            # 常见 JS/JSON 转义修复
+            content = content.replace('\\"', '"')
+            content = content.replace("\\'", "'")
+            content = content.replace("\\n", "\n")
+            content = content.replace("\\r", "\r")
+            content = content.replace("\\t", "\t")
+
             try:
                 soup = BeautifulSoup(content, "lxml")
             except Exception:
                 soup = BeautifulSoup(content, "html.parser")
 
+            # --------------------------------------------------------
+            # 3. 从 img 标签提取
+            # --------------------------------------------------------
             for img in soup.find_all("img"):
                 for attr in [
                     "src",
@@ -751,24 +1260,46 @@ class Alibaba1688Parser(BaseParser):
                     "data-lazy-src",
                     "data-img",
                     "data-url",
+                    "data-lazyload",
+                    "srcset",
+                    "data-srcset",
                 ]:
                     value = img.get(attr)
-                    if value:
+                    if not value:
+                        continue
+
+                    if attr in ["srcset", "data-srcset"]:
+                        for part in value.split(","):
+                            u = part.strip().split(" ")[0]
+                            if u:
+                                urls.append(u)
+                    else:
                         urls.append(value)
 
-            # 详情内容可能是转义字符串，再正则扫一次
+            # --------------------------------------------------------
+            # 4. 从 background-image 提取
+            # --------------------------------------------------------
+            urls.extend(self._extract_background_image_urls(content))
+
+            # --------------------------------------------------------
+            # 5. 从全文正则提取图片 URL
+            # --------------------------------------------------------
             urls.extend(self._extract_image_urls_from_text(content))
 
         urls = self._normalize_urls(urls)
+
+        # 详情图这里不能太严格过滤营销图/参数图，
+        # 只做基本商品图 URL 判断。
         urls = [
             u for u in urls
-            if self._is_likely_product_image(u, image_type="detail")
+            if self._is_likely_product_image(u)
         ]
 
         return self._dedupe_keep_order(urls)
 
+
     # ------------------------------------------------------------------
-    # JSON / 文本提取工具
+    # 文本 / URL 工具
     # ------------------------------------------------------------------
 
     def _extract_json_like_blocks_by_key(
@@ -777,9 +1308,6 @@ class Alibaba1688Parser(BaseParser):
         key: str,
         max_len: int = 10000,
     ) -> list[str]:
-        """
-        按 key 提取附近文本块。
-        """
         blocks = []
 
         key_patterns = [
@@ -811,9 +1339,6 @@ class Alibaba1688Parser(BaseParser):
         return blocks
 
     def _extract_image_urls_from_text(self, text: str) -> list[str]:
-        """
-        从文本中提取图片 URL。
-        """
         if not text:
             return []
 
@@ -836,10 +1361,6 @@ class Alibaba1688Parser(BaseParser):
         return urls
 
     def _extract_background_image_urls(self, text: str) -> list[str]:
-        """
-        提取 style="background-image:url(...)" 里的图片。
-        1688 SKU 小图、主图缩略图有时不是 img 标签，而是背景图。
-        """
         if not text:
             return []
 
@@ -858,10 +1379,6 @@ class Alibaba1688Parser(BaseParser):
                 urls.append(m.group(1))
 
         return urls
-
-    # ------------------------------------------------------------------
-    # URL 标准化 / 过滤
-    # ------------------------------------------------------------------
 
     def _normalize_urls(self, urls: list[str]) -> list[str]:
         result = []
@@ -896,7 +1413,7 @@ class Alibaba1688Parser(BaseParser):
         url = url.rstrip("]")
         url = url.rstrip("}")
 
-        # 还原阿里图片缩略图后缀
+        # xxx.jpg_300x300.jpg -> xxx.jpg
         url = re.sub(
             r'(\.(?:jpg|jpeg|png|webp))_\d+x\d+(?:q\d+)?\.(?:jpg|jpeg|png|webp)$',
             r'\1',
@@ -904,6 +1421,7 @@ class Alibaba1688Parser(BaseParser):
             flags=re.I,
         )
 
+        # xxx.jpg_300x300 -> xxx.jpg
         url = re.sub(
             r'(\.(?:jpg|jpeg|png|webp))_\d+x\d+(?:q\d+)?$',
             r'\1',
@@ -911,8 +1429,17 @@ class Alibaba1688Parser(BaseParser):
             flags=re.I,
         )
 
+        # xxx.jpg_300x300q90_... -> xxx.jpg
         url = re.sub(
             r'(\.(?:jpg|jpeg|png|webp))_\d+x\d+.*$',
+            r'\1',
+            url,
+            flags=re.I,
+        )
+
+        # xxx.jpg_.webp -> xxx.jpg
+        url = re.sub(
+            r'(\.(?:jpg|jpeg|png|webp))_\.(?:webp|jpg|jpeg|png)$',
             r'\1',
             url,
             flags=re.I,
@@ -927,10 +1454,7 @@ class Alibaba1688Parser(BaseParser):
 
         return url
 
-    def _is_likely_product_image(self, url: str, image_type: str = "") -> bool:
-        """
-        判断是否像商品图片。
-        """
+    def _is_likely_product_image(self, url: str) -> bool:
         if not url:
             return False
 
@@ -957,6 +1481,13 @@ class Alibaba1688Parser(BaseParser):
             "btn",
             "play",
             "video",
+            "rotate",
+            "rotation",
+            "zoom",
+            "expand",
+            # 注意：
+            # 不要在全局 URL 过滤中加入 param / parameter，
+            # 否则可能误杀详情图里的参数图。
             "collect",
             "favorite",
             "share",
@@ -1077,9 +1608,6 @@ class Alibaba1688Parser(BaseParser):
         return True
 
     def _is_service_or_ui_context(self, text: str, url: str) -> bool:
-        """
-        根据 URL 附近上下文过滤服务图标 / UI 图标。
-        """
         if not text or not url:
             return False
 
@@ -1103,6 +1631,12 @@ class Alibaba1688Parser(BaseParser):
             "btn",
             "play",
             "video",
+            "rotate",
+            "rotation",
+            "zoom",
+            "expand",
+            "param",
+            "parameter",
             "avatar",
             "qrcode",
             "qr",
@@ -1166,6 +1700,12 @@ class Alibaba1688Parser(BaseParser):
             "供应商",
             "收藏",
             "分享",
+            "播放",
+            "视频",
+            "旋转",
+            "放大",
+            "参数",
+            "宝贝",
         ]
 
         if any(w in ctx for w in bad_cn_words):
@@ -1174,10 +1714,6 @@ class Alibaba1688Parser(BaseParser):
         return False
 
     def _is_detail_marketing_context(self, text: str, url: str) -> bool:
-        """
-        判断 URL 附近上下文是否像详情营销图。
-        主要用于 SKU / JSON 主图补充过滤，不用于左侧主图 DOM 过滤。
-        """
         if not text or not url:
             return False
 
@@ -1216,16 +1752,7 @@ class Alibaba1688Parser(BaseParser):
 
         return False
 
-    # ------------------------------------------------------------------
-    # 解码 / 去重
-    # ------------------------------------------------------------------
-
     def _decode_text(self, text: str) -> str:
-        """
-        安全解码文本。
-
-        不对整段 HTML 做 unicode_escape，避免中文变成乱码。
-        """
         if not text:
             return ""
 
@@ -1275,13 +1802,53 @@ class Alibaba1688Parser(BaseParser):
     def _image_dedupe_key(self, url: str) -> str:
         """
         生成图片去重 key。
+
+        重点处理 1688 / 阿里 CDN 图片多尺寸问题，例如：
+            xxx.jpg
+            xxx.jpg_100x100.jpg
+            xxx.jpg_300x300.jpg
+            xxx.jpg_460x460q90.jpg
+            xxx.jpg_.webp
+            xxx.jpg_720x720q90.jpg_.webp
+
+        这些都应该视为同一张图。
         """
         if not url:
             return ""
 
         u = url.lower().strip()
+
+        # 去查询参数
         u = u.split("?")[0]
 
+        # 去协议
+        u = u.replace("https://", "").replace("http://", "")
+
+        # 去尾部非法字符
+        u = u.rstrip("\\")
+        u = u.rstrip(",")
+        u = u.rstrip(";")
+        u = u.rstrip(")")
+        u = u.rstrip("]")
+        u = u.rstrip("}")
+
+        # 处理 xxx.jpg_.webp / xxx.png_.webp
+        u = re.sub(
+            r"(\.(?:jpg|jpeg|png|webp))_\.(?:webp|jpg|jpeg|png)$",
+            r"\1",
+            u,
+            flags=re.I,
+        )
+
+        # 处理 xxx.jpg_720x720q90.jpg_.webp
+        u = re.sub(
+            r"(\.(?:jpg|jpeg|png|webp))_\d+x\d+(?:q\d+)?\.(?:jpg|jpeg|png|webp)_\.(?:webp|jpg|jpeg|png)$",
+            r"\1",
+            u,
+            flags=re.I,
+        )
+
+        # 处理 xxx.jpg_720x720q90.jpg
         u = re.sub(
             r"(\.(?:jpg|jpeg|png|webp))_\d+x\d+(?:q\d+)?\.(?:jpg|jpeg|png|webp)$",
             r"\1",
@@ -1289,6 +1856,7 @@ class Alibaba1688Parser(BaseParser):
             flags=re.I,
         )
 
+        # 处理 xxx.jpg_720x720q90
         u = re.sub(
             r"(\.(?:jpg|jpeg|png|webp))_\d+x\d+(?:q\d+)?$",
             r"\1",
@@ -1296,38 +1864,41 @@ class Alibaba1688Parser(BaseParser):
             flags=re.I,
         )
 
-        u = re.sub(
-            r"(\.(?:jpg|jpeg|png|webp))_\d+x\d+.*$",
-            r"\1",
-            u,
-            flags=re.I,
-        )
+        # 兜底：只要第一个图片扩展名后面还有缩略参数，直接截断
+        match = re.match(r"^(.*?\.(?:jpg|jpeg|png|webp))(?:_.*)?$", u, re.I)
+        if match:
+            u = match.group(1)
 
         return u
 
-    # ------------------------------------------------------------------
-    # 请求
-    # ------------------------------------------------------------------
-
     def _request_text(self, url: str) -> str:
+        """
+        请求文本内容。
+
+        重要：
+            HTTP 请求头中不能包含中文字符。
+            之前 User-Agent 中如果写了 Chrome/[IP 地址] 会导致：
+            'ascii' codec can't encode characters
+        """
         headers = {
             "User-Agent": (
                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                 "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/124.0.0.0 Safari/537.36"
+                "Chrome/120.0.0.0 Safari/537.36"
             ),
             "Referer": "https://detail.1688.com/",
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Accept": (
+                "text/html,application/xhtml+xml,application/xml;"
+                "q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8"
+            ),
+            "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+            "Connection": "keep-alive",
         }
 
         with httpx.Client(headers=headers, timeout=20, follow_redirects=True) as client:
             resp = client.get(url)
             resp.raise_for_status()
             return resp.text
-
-    # ------------------------------------------------------------------
-    # ImageItem 构造
-    # ------------------------------------------------------------------
 
     def _build_images(
         self,
@@ -1362,10 +1933,6 @@ class Alibaba1688Parser(BaseParser):
             )
 
         return images
-
-    # ------------------------------------------------------------------
-    # 日志
-    # ------------------------------------------------------------------
 
     def _log(self, message: str):
         if self.log_callback:

@@ -32,11 +32,13 @@ class JDParser(BaseParser):
         headless: bool = False,
         login_wait_seconds: int = 180,
     ):
-       self.browser = BrowserClient(
+        self.browser = BrowserClient(
+            user_data_dir="browser_data/jd",
             headless=headless,
             login_wait_seconds=login_wait_seconds,
             log_callback=log_callback,
         )
+
 
 
     def parse(self, url: str) -> ProductData:

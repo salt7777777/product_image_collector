@@ -24,10 +24,12 @@ class PddParser(BaseParser):
         login_wait_seconds: int = 180,
     ):
         self.browser = BrowserClient(
+            user_data_dir="browser_data/pdd",
             headless=headless,
             login_wait_seconds=login_wait_seconds,
             log_callback=log_callback,
         )
+
 
     def parse(self, url: str) -> ProductData:
         platform, product_id = PlatformDetector.detect(url)

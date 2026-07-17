@@ -104,6 +104,116 @@ class BrowserClient:
             context.close()
 
             return html
+            
+    def open_page_with_extracted_data(
+        self,
+        url: str,
+        extract_script: str,
+        wait_until: str = "domcontentloaded",
+    ) -> dict:
+        """
+        打开页面，等待渲染后执行 JS，返回：
+            {
+                "html": 页面 HTML,
+                "data": JS 提取结果,
+                "final_url": 最终页面 URL,
+            }
+
+        主要用于 1688：
+            主图 / SKU 图很多是前端渲染后的 DOM，
+            不能只靠 page.content() 静态 HTML 解析。
+        """
+
+        self.user_data_dir.mkdir(parents=True, exist_ok=True)
+
+        with sync_playwright() as p:
+            context = p.chromium.launch_persistent_context(
+                user_data_dir=str(self.user_data_dir),
+                headless=self.headless,
+                viewport={"width": 1366, "height": 900},
+                args=[
+                    "--disable-blink-features=AutomationControlled",
+                    "--start-maximized",
+                ],
+            )
+
+            page = context.new_page()
+            page.set_default_timeout(self.timeout)
+
+            self.log("正在打开商品页面...")
+
+            try:
+                page.goto(url, wait_until=wait_until, timeout=self.timeout)
+            except PlaywrightTimeoutError:
+                self.log("页面加载超时，继续尝试读取当前页面...")
+            except Exception as e:
+                context.close()
+                raise RuntimeError(f"页面打开失败：{e}")
+
+            page.wait_for_timeout(2000)
+
+            if self._is_login_page(page):
+                self.log("检测到当前页面为登录页。")
+                self.log("请在弹出的浏览器中手动完成登录。")
+                self.log(f"程序最多等待 {self.login_wait_seconds} 秒，登录成功后会自动继续。")
+
+                login_ok = self._wait_for_login_finished(page, original_url=url)
+
+                if not login_ok:
+                    context.close()
+                    raise RuntimeError("登录等待超时，请确认已完成登录。")
+
+                self.log("检测到登录完成，继续采集商品页面。")
+
+                try:
+                    page.wait_for_load_state("domcontentloaded", timeout=self.timeout)
+                except Exception:
+                    pass
+
+                page.wait_for_timeout(2500)
+
+            try:
+                self._try_click_detail_tab(page)
+            except Exception:
+                pass
+
+            try:
+                self._auto_scroll(page)
+            except Exception:
+                pass
+
+            page.wait_for_timeout(1500)
+
+            try:
+                page.evaluate("window.scrollTo(0, 0)")
+                page.wait_for_timeout(800)
+            except Exception:
+                pass
+
+            data = {}
+
+            try:
+                data = page.evaluate(extract_script)
+            except Exception as e:
+                self.log(f"页面 JS 数据提取失败：{e}")
+                data = {}
+
+            html = page.content()
+
+            if self._looks_like_login_html(html, page.url):
+                context.close()
+                raise RuntimeError("当前仍是登录页，请先完成登录后重试。")
+
+            final_url = page.url
+
+            context.close()
+
+            return {
+                "html": html,
+                "data": data or {},
+                "final_url": final_url,
+            }
+
 
     def open_page_and_eval(
         self,
