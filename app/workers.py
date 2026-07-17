@@ -605,19 +605,19 @@ class BatchDownloadWorker(QThread):
                             "product": product,
                             "product_dir": product_dir,
                         }
-                    )
+                )
 
-                    try:
-                        if task_state_manager:
-                            task_state_manager.mark_done(product, product_dir)
-                    except Exception:
-                        pass
+                try:
+                    if task_state_manager:
+                        task_state_manager.mark_done(product, product_dir)
+                except Exception:
+                    pass
 
                 TaskLogger.save_product_json(
                         product_dir=product_dir,
                         product=product,
                         download_result=result,
-                    )
+                )
 
 
                 batch_items.append(
@@ -647,7 +647,7 @@ class BatchDownloadWorker(QThread):
                 except Exception:
                     pass
 
-                break
+                return
 
 
             report_paths = TaskLogger.save_batch_report(
