@@ -7,6 +7,9 @@ from core.downloader import ImageDownloader
 from core.file_manager import FileManager
 from core.task_logger import TaskLogger
 from core.image_link_reporter import ImageLinkReportExporter
+from core.parse_cache import ParseCache
+from core.local_file_reporter import LocalFileReportExporter
+from core.task_state import TaskStateManager
 from core.models import DownloadResult, DuplicateImage, ConvertedImage, SmallImage
 from parsers import get_parser
 from utils.file_hash import dedupe_image_files
@@ -17,6 +20,12 @@ from utils.image_filter import filter_small_images
 class BatchParseWorker(QThread):
     """
     批量商品解析线程。
+
+    已加入解析结果缓存：
+        cache/parse_results/
+
+    默认缓存有效期：
+        24 小时
     """
 
     log_signal = Signal(str)
@@ -37,6 +46,12 @@ class BatchParseWorker(QThread):
         self.login_wait_seconds = login_wait_seconds
         self._stop_requested = False
 
+        # 解析结果缓存，第一版默认开启，24 小时有效。
+        self.parse_cache = ParseCache(
+            cache_dir="cache/parse_results",
+            expire_hours=24,
+        )
+
     def stop(self):
         self._stop_requested = True
 
@@ -54,6 +69,12 @@ class BatchParseWorker(QThread):
             return
 
         try:
+            # 启动时顺手清理过期缓存
+            try:
+                self.parse_cache.clear_expired()
+            except Exception:
+                pass
+
             for index, url in enumerate(self.urls, start=1):
                 if self.is_stop_requested():
                     self.log_signal.emit("解析任务已停止。")
@@ -74,7 +95,7 @@ class BatchParseWorker(QThread):
                     platform, product_id = PlatformDetector.detect(url)
 
                     if platform == "unknown":
-                        message = "暂不支持该平台，请输入京东、淘宝、天猫或拼多多商品链接。"
+                        message = "暂不支持该平台，请输入京东、淘宝、天猫、1688 或拼多多商品链接。"
                         self.log_signal.emit(f"{prefix} 解析失败：{message}")
                         failed.append(
                             {
@@ -88,6 +109,44 @@ class BatchParseWorker(QThread):
                     self.log_signal.emit(
                         f"{prefix} 平台识别成功：{platform}，商品ID：{product_id or '未识别'}"
                     )
+
+                    # ----------------------------------------------------
+                    # 1. 优先读取解析缓存
+                    # ----------------------------------------------------
+                    cached_product = None
+
+                    try:
+                        cached_product = self.parse_cache.load(
+                            platform=platform,
+                            product_id=product_id,
+                            url=url,
+                        )
+                    except Exception as e:
+                        self.log_signal.emit(f"{prefix} 读取解析缓存失败，继续正常解析：{e}")
+
+                    if cached_product:
+                        # 缓存里的 url 可能是旧规范化链接，这里更新成当前输入链接。
+                        cached_product.url = url
+
+                        self.log_signal.emit(
+                            f"{prefix} 命中解析缓存：{platform}_{product_id or 'unknown'}"
+                        )
+                        self.log_signal.emit(
+                            f"{prefix} 缓存商品标题：{cached_product.title}"
+                        )
+                        self.log_signal.emit(
+                            f"{prefix} 缓存解析结果：主图 {len(cached_product.main_images)} 张，"
+                            f"详情图 {len(cached_product.detail_images)} 张，"
+                            f"SKU图 {len(cached_product.sku_images)} 张"
+                        )
+
+                        products.append(cached_product)
+                        self._emit_progress(index, total)
+                        continue
+
+                    # ----------------------------------------------------
+                    # 2. 缓存未命中，正常解析
+                    # ----------------------------------------------------
                     self.log_signal.emit(f"{prefix} 开始解析商品数据...")
 
                     parser = get_parser(
@@ -99,31 +158,8 @@ class BatchParseWorker(QThread):
 
                     product = parser.parse(url)
 
-                    if self.is_stop_requested():
-                        self.log_signal.emit("解析任务已停止。")
-                        self.stopped_signal.emit(
-                            {
-                                "products": products,
-                                "failed": failed,
-                                "stopped": True,
-                            }
-                        )
-                        return
-
-                    if product.title.strip() in ["登录", "请登录", "用户登录"]:
-                        message = "当前采集到的是登录页，不是商品详情页。请完成登录后重新解析。"
-                        self.log_signal.emit(f"{prefix} 解析失败：{message}")
-                        failed.append(
-                            {
-                                "url": url,
-                                "reason": message,
-                            }
-                        )
-                        self._emit_progress(index, total)
-                        continue
-
-                    if product.total_count() == 0:
-                        message = "未识别到商品图片。可能仍未登录成功，或页面结构发生变化。"
+                    if not product:
+                        message = "解析结果为空。"
                         self.log_signal.emit(f"{prefix} 解析失败：{message}")
                         failed.append(
                             {
@@ -143,46 +179,50 @@ class BatchParseWorker(QThread):
                         f"SKU图 {len(product.sku_images)} 张"
                     )
 
+                    # ----------------------------------------------------
+                    # 3. 保存解析缓存
+                    # ----------------------------------------------------
+                    try:
+                        self.parse_cache.save(product)
+                        self.log_signal.emit(
+                            f"{prefix} 解析结果已写入缓存。"
+                        )
+                    except Exception as e:
+                        self.log_signal.emit(
+                            f"{prefix} 写入解析缓存失败，不影响本次解析：{e}"
+                        )
+
                 except Exception as e:
-                    message = str(e)
-                    self.log_signal.emit(f"{prefix} 解析失败：{message}")
+                    reason = str(e)
+                    self.log_signal.emit(f"{prefix} 解析失败：{reason}")
                     failed.append(
                         {
                             "url": url,
-                            "reason": message,
+                            "reason": reason,
                         }
                     )
 
                 self._emit_progress(index, total)
 
-            if not products:
-                if failed:
-                    self.error_signal.emit(f"批量解析失败：全部 {len(failed)} 个链接解析失败。")
-                else:
-                    self.error_signal.emit("批量解析失败：未解析到任何商品。")
-                return
-
-            if total == 1:
-                self.log_signal.emit("商品解析完成。")
-            else:
-                self.log_signal.emit(
-                    f"批量解析完成：成功 {len(products)} 个，失败 {len(failed)} 个。"
-                )
-
             self.success_signal.emit(
                 {
                     "products": products,
                     "failed": failed,
-                    "stopped": False,
                 }
             )
 
         except Exception as e:
-            self.error_signal.emit(f"解析任务失败：{e}")
+            self.error_signal.emit(str(e))
 
-    def _emit_progress(self, current: int, total: int):
-        value = int(current / total * 100) if total else 0
-        self.progress_signal.emit(value)
+    def _emit_progress(self, index: int, total: int):
+        if total <= 0:
+            self.progress_signal.emit(0)
+            return
+
+        percent = int(index / total * 100)
+        percent = max(0, min(100, percent))
+        self.progress_signal.emit(percent)
+
 
 
 class BatchDownloadWorker(QThread):
@@ -240,12 +280,27 @@ class BatchDownloadWorker(QThread):
         return self._stop_requested
 
     def run(self):
+        local_file_records = []
+        task_state_manager = None
+
         if not self.products:
             self.error_signal.emit("没有可下载的商品，请先解析商品。")
             return
 
         try:
+            # ------------------------------------------------------------
+            # 任务状态记录：阶段 1，仅记录状态，不做 UI 恢复
+            # ------------------------------------------------------------
+            try:
+                task_state_manager = TaskStateManager(output_dir=self.base_dir)
+                task_state_manager.start(self.products)
+                self.log_signal.emit(f"任务状态文件已生成：{task_state_manager.get_state_path()}")
+            except Exception as e:
+                task_state_manager = None
+                self.log_signal.emit(f"任务状态记录初始化失败：{e}")
+
             total_products = len(self.products)
+
 
             total_images = self._count_total_images()
             finished_images = 0
@@ -279,7 +334,14 @@ class BatchDownloadWorker(QThread):
                 product_dir = FileManager.create_product_dir(output_base_dir, product)
                 last_product_dir = product_dir
 
+                try:
+                    if task_state_manager:
+                        task_state_manager.mark_running(product)
+                except Exception:
+                    pass
+
                 dirs_by_type = FileManager.create_type_dirs(product_dir, self.selected_types)
+
 
                 images_by_type = {
                     "main": product.main_images if self.selected_types.get("main") else [],
@@ -537,12 +599,26 @@ class BatchDownloadWorker(QThread):
                     selected_types=self.selected_types,
                     download_result=result,
                 )
+                
+                local_file_records.append(
+                        {
+                            "product": product,
+                            "product_dir": product_dir,
+                        }
+                    )
+
+                    try:
+                        if task_state_manager:
+                            task_state_manager.mark_done(product, product_dir)
+                    except Exception:
+                        pass
 
                 TaskLogger.save_product_json(
-                    product_dir=product_dir,
-                    product=product,
-                    download_result=result,
-                )
+                        product_dir=product_dir,
+                        product=product,
+                        download_result=result,
+                    )
+
 
                 batch_items.append(
                     {
@@ -561,9 +637,18 @@ class BatchDownloadWorker(QThread):
                         f"小图过滤 {result.small_filtered_count} 张。"
                     )
 
-                if self.is_stop_requested():
-                    self.log_signal.emit("下载任务已停止。")
-                    break
+            if self.is_stop_requested():
+                self.log_signal.emit("下载任务已停止。")
+
+                try:
+                    if task_state_manager:
+                        task_state_manager.mark_stopped()
+                        self.log_signal.emit("任务状态已标记为停止。")
+                except Exception:
+                    pass
+
+                break
+
 
             report_paths = TaskLogger.save_batch_report(
                 base_dir=self.base_dir,
@@ -637,6 +722,73 @@ class BatchDownloadWorker(QThread):
                     f"小图过滤 {aggregate_result.small_filtered_count} 张，"
                     f"成功率 {aggregate_result.success_rate}%"
                 )
+                        # ------------------------------------------------------------
+            # 本地文件清单 Excel
+            # ------------------------------------------------------------
+            try:
+                base_save_dir = None
+
+                # 兼容不同版本 BatchDownloadWorker 的保存目录变量名
+                for attr_name in [
+                    "save_dir",
+                    "base_dir",
+                    "output_dir",
+                    "download_dir",
+                    "root_dir",
+                ]:
+                    value = getattr(self, attr_name, None)
+                    if value:
+                        base_save_dir = value
+                        break
+
+                # 如果 worker 里没有保存目录变量，则从已下载商品目录反推 output 根目录
+                if not base_save_dir and local_file_records:
+                    first_product_dir = Path(local_file_records[0]["product_dir"])
+
+                    # 常见结构：
+                    # output/商品目录
+                    # output/2026-07-17/商品目录
+                    # output/2026-07-17/1688/商品目录
+                    #
+                    # 尽量向上查找名为 output 的目录
+                    output_root = None
+                    for parent in [first_product_dir] + list(first_product_dir.parents):
+                        if parent.name.lower() == "output":
+                            output_root = parent
+                            break
+
+                    if output_root:
+                        base_save_dir = output_root
+                    else:
+                        # 找不到 output 时，退回到商品目录的上一级
+                        base_save_dir = first_product_dir.parent
+
+                # 最后兜底
+                if not base_save_dir:
+                    base_save_dir = "output"
+
+                report_dir = Path(base_save_dir) / "下载报告"
+
+                local_report_path = LocalFileReportExporter.export(
+                    records=local_file_records,
+                    report_dir=report_dir,
+                )
+
+                if local_report_path:
+                    self.log_signal.emit(f"本地文件清单已生成：{local_report_path}")
+                else:
+                    self.log_signal.emit("本地文件清单未生成：未扫描到本地图片文件。")
+
+            except Exception as e:
+                self.log_signal.emit(f"本地文件清单生成失败：{e}")
+
+
+            try:
+                if task_state_manager and not self.is_stop_requested():
+                    task_state_manager.mark_finished()
+                    self.log_signal.emit("任务状态已标记为完成。")
+            except Exception:
+                pass
 
             self.success_signal.emit(
                 self.base_dir,
@@ -648,7 +800,16 @@ class BatchDownloadWorker(QThread):
             )
 
         except Exception as e:
+            try:
+                if task_state_manager:
+                    task_state_manager.mark_stopped()
+                    self.log_signal.emit("任务状态已标记为停止。")
+            except Exception:
+                pass
+
             self.error_signal.emit(f"下载失败：{e}")
+
+
 
     def _count_total_images(self) -> int:
         total = 0

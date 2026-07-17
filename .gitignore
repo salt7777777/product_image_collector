@@ -24,3 +24,7 @@ env/
 __pycache__/
 *.pyc
 .env
+
+cache/
+*.bak_task_state
+patch_workers_task_state.py
