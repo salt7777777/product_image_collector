@@ -4,11 +4,6 @@ from urllib.parse import urljoin, urlparse
 def normalize_image_url(url: str, base_url: str = "https:") -> str:
     """
     规范化图片 URL。
-
-    支持：
-    //img.xxx.com/xxx.jpg
-    /xxx/xxx.jpg
-    https://xxx
     """
     if not url:
         return ""
@@ -33,8 +28,10 @@ def get_url_ext(url: str) -> str:
     """
     path = urlparse(url).path.lower()
 
-    for ext in [".jpg", ".jpeg", ".png", ".webp", ".gif", ".avif"]:
+    for ext in [".jpg", ".jpeg", ".png", ".webp", ".gif", ".avif", ".apng"]:
         if ext in path:
+            if ext == ".apng":
+                return "png"
             return ext.replace(".", "")
 
     return "jpg"
