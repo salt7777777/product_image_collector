@@ -28,3 +28,5 @@ __pycache__/
 cache/
 *.bak_task_state
 patch_workers_task_state.py
+app/main_window.py.bak_resume_task
+patch_main_window_resume_task.py
