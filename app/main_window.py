@@ -34,6 +34,7 @@ from app.workers import (
 from app.browser_session_worker import LoginBrowserWorker
 from core.preview_generator import PreviewGenerator
 from core.app_config import AppConfig
+from core.task_state import TaskStateManager
 
 
 class MainWindow(QMainWindow):
@@ -64,6 +65,7 @@ class MainWindow(QMainWindow):
 
         self._init_ui()
         self._bind_events()
+        self.refresh_resume_task_button()
 
     # ------------------------------------------------------------------
     # UI
@@ -262,6 +264,8 @@ class MainWindow(QMainWindow):
         self.import_selection_button = QPushButton("导入选择结果")
         self.open_dir_button = QPushButton("打开保存目录")
         self.import_links_button = QPushButton("导入链接文件")
+
+        self.resume_task_button = QPushButton("继续上次任务")
         self.clear_log_button = QPushButton("清空日志")
 
         self.download_button.setEnabled(False)
@@ -279,6 +283,8 @@ class MainWindow(QMainWindow):
         button_layout.addWidget(self.import_selection_button)
         button_layout.addWidget(self.open_dir_button)
         button_layout.addWidget(self.import_links_button)
+
+        button_layout.addWidget(self.resume_task_button)
         button_layout.addWidget(self.clear_log_button)
         button_layout.addStretch()
 
@@ -305,6 +311,8 @@ class MainWindow(QMainWindow):
         self.stop_button.clicked.connect(self.stop_current_task)
         self.preview_button.clicked.connect(self.preview_images)
         self.import_selection_button.clicked.connect(self.import_selection_file)
+        
+        self.resume_task_button.clicked.connect(self.resume_last_task)
         self.open_dir_button.clicked.connect(self.open_last_dir)
         self.import_links_button.clicked.connect(self.import_links_file)
         self.clear_log_button.clicked.connect(self.clear_log)
@@ -1668,6 +1676,204 @@ class MainWindow(QMainWindow):
 
         except Exception:
             return url
+    
+    def append_log(self, message: str):
+        """
+        追加日志到实时日志框。
+
+        兼容当前 main_window.py 中不同日志控件命名。
+        如果找不到明确日志控件，则自动寻找除 url_input 外的 QTextEdit。
+        """
+        try:
+            text = f"[{datetime.now().strftime('%H:%M:%S')}] {message}"
+
+            # 常见日志控件命名兼容
+            candidate_names = [
+                "log_output",
+                "log_text",
+                "log_edit",
+                "log_browser",
+                "log_view",
+                "log_area",
+                "log_box",
+            ]
+
+            for name in candidate_names:
+                widget = getattr(self, name, None)
+                if widget is not None and hasattr(widget, "append"):
+                    widget.append(text)
+                    return
+
+            # 自动查找 QTextEdit，排除商品链接输入框
+            for value in self.__dict__.values():
+                if isinstance(value, QTextEdit) and value is not getattr(self, "url_input", None):
+                    value.append(text)
+                    return
+
+            # 实在找不到日志框时，至少打印到控制台
+            print(text)
+
+        except Exception:
+            try:
+                print(message)
+            except Exception:
+                pass
+
+
+    def refresh_resume_task_button(self):
+        """
+        刷新“继续上次任务”按钮状态。
+
+        有未完成任务：
+            按钮可点击并高亮。
+
+        没有未完成任务：
+            按钮禁用并灰色。
+        """
+        try:
+            button = getattr(self, "resume_task_button", None)
+            if button is None:
+                return
+
+            base_dir = self._get_current_save_dir_for_task_state()
+            state_path = TaskStateManager.find_latest_unfinished(base_dir)
+
+            if state_path:
+                button.setEnabled(True)
+                button.setToolTip(f"检测到未完成任务：{state_path}")
+                button.setStyleSheet(
+                    """
+                    QPushButton {
+                        background-color: #ff9800;
+                        color: white;
+                        font-weight: bold;
+                    }
+                    QPushButton:hover {
+                        background-color: #ffa726;
+                    }
+                    """
+                )
+            else:
+                button.setEnabled(False)
+                button.setToolTip("没有未完成任务")
+                button.setStyleSheet(
+                    """
+                    QPushButton {
+                        background-color: #666666;
+                        color: #cccccc;
+                    }
+                    """
+                )
+
+        except Exception:
+            try:
+                button = getattr(self, "resume_task_button", None)
+                if button:
+                    button.setEnabled(False)
+            except Exception:
+                pass
+
+    
+    def resume_last_task(self):
+        """
+        继续上次任务 - 2A 低风险版。
+
+        功能：
+            1. 查找 output/任务状态 下最近一个未完成任务；
+            2. 提取 pending / failed / running 商品链接；
+            3. 恢复到商品链接输入框；
+            4. 用户手动点击“解析商品”继续。
+        """
+        try:
+            if hasattr(self, "_is_task_running") and self._is_task_running():
+                QMessageBox.warning(self, "任务运行中", "当前有任务正在运行，请先停止或等待完成。")
+                return
+
+            base_dir = self._get_current_save_dir_for_task_state()
+
+            state_path = TaskStateManager.find_latest_unfinished(base_dir)
+
+            if not state_path:
+                QMessageBox.information(self, "继续上次任务", "没有找到未完成任务。")
+                self.append_log("没有找到未完成任务。")
+                return
+
+            manager = TaskStateManager.load(state_path)
+            urls = manager.get_unfinished_urls()
+
+            if not urls:
+                QMessageBox.information(self, "继续上次任务", "未完成任务中没有待恢复的商品链接。")
+                self.append_log(f"未完成任务没有待恢复链接：{state_path}")
+                return
+
+            self.url_input.setPlainText("\n".join(urls))
+            
+            try:
+                manager.mark_resumed()
+                self.append_log(f"原任务状态已标记为已恢复：{state_path}")
+            except Exception as e:
+                self.append_log(f"原任务状态标记为已恢复失败：{e}")
+
+            self.refresh_resume_task_button()
+
+
+            # 清理当前解析结果，避免用户误以为还是旧商品
+            self.product = None
+            self.products = []
+            self.original_products = []
+            self.failed_parse_items = []
+            self.selection_file_path = None
+
+            self.platform_label.setText("平台：-")
+            self.product_id_label.setText("商品ID：-")
+            self.title_label.setText("商品标题：-")
+
+            self.append_log(f"已恢复上次未完成任务：{state_path}")
+            self.append_log(f"已恢复待处理商品链接：{len(urls)} 个")
+            self.append_log("请点击“解析商品”，解析完成后再点击“开始下载”继续任务。")
+
+            QMessageBox.information(
+                self,
+                "继续上次任务",
+                f"已恢复 {len(urls)} 个未完成商品链接。\n\n"
+                "请点击“解析商品”，解析完成后再点击“开始下载”。"
+            )
+
+        except Exception as e:
+            QMessageBox.critical(self, "继续上次任务失败", str(e))
+            self.append_log(f"继续上次任务失败：{e}")
+
+    def _get_current_save_dir_for_task_state(self) -> str:
+        """
+        获取当前保存目录，用于查找 output/任务状态。
+
+        兼容不同版本 main_window.py 里的保存路径控件命名。
+        """
+        candidates = [
+            "save_dir_input",
+            "save_path_input",
+            "output_dir_input",
+            "base_dir_input",
+        ]
+
+        for name in candidates:
+            widget = getattr(self, name, None)
+            if widget:
+                try:
+                    value = widget.text().strip()
+                    if value:
+                        return value
+                except Exception:
+                    pass
+
+        try:
+            value = getattr(self.config, "save_dir", "")
+            if value:
+                return value
+        except Exception:
+            pass
+
+        return "output"
 
     def closeEvent(self, event):
         self.save_current_config()

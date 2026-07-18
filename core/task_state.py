@@ -1,7 +1,6 @@
 import json
 from pathlib import Path
 from datetime import datetime
-from dataclasses import asdict
 
 from core.models import ProductData
 
@@ -10,11 +9,12 @@ class TaskStateManager:
     """
     任务状态管理器。
 
-    当前阶段用途：
-        自动记录批量下载任务状态，为后续“断点续跑”做准备。
-
-    状态文件示例：
-        output/任务状态/task_state_20260717_170000.json
+    当前用途：
+        1. 自动记录批量下载任务状态；
+        2. 为断点续跑提供状态文件；
+        3. 支持查找最近一个未完成任务；
+        4. 支持提取未完成商品链接；
+        5. 支持将旧任务标记为 resumed，避免反复恢复同一个旧任务。
     """
 
     STATUS_PENDING = "pending"
@@ -23,6 +23,7 @@ class TaskStateManager:
     STATUS_FAILED = "failed"
     STATUS_STOPPED = "stopped"
     STATUS_FINISHED = "finished"
+    STATUS_RESUMED = "resumed"
 
     def __init__(
         self,
@@ -54,9 +55,6 @@ class TaskStateManager:
     # ------------------------------------------------------------------
 
     def start(self, products: list[ProductData]):
-        """
-        初始化任务状态。
-        """
         product_items = []
 
         for index, product in enumerate(products or [], start=1):
@@ -154,9 +152,9 @@ class TaskStateManager:
 
     def mark_stopped(self):
         """
-        标记任务被用户停止。
+        标记任务停止。
 
-        当前正在 running 的商品会改成 pending，
+        当前正在 running 的商品改成 pending，
         方便后续续跑时重新处理。
         """
         for item in self.state.get("products", []):
@@ -175,15 +173,58 @@ class TaskStateManager:
         self._refresh_counts()
         self.save()
 
+    def mark_resumed(self):
+        """
+        标记该任务已经被“继续上次任务”功能接管。
+
+        作用：
+            防止同一个 stopped 任务被反复识别出来。
+        """
+        self.state["status"] = self.STATUS_RESUMED
+        self.state["running_product_key"] = ""
+        self.state["resumed_at"] = self._now()
+        self._refresh_counts()
+        self.save()
+
     # ------------------------------------------------------------------
     # 查询
     # ------------------------------------------------------------------
 
     def get_pending_products(self) -> list[dict]:
+        """
+        返回未完成商品记录。
+
+        包含：
+            pending
+            failed
+            running
+
+        running 用于程序异常退出时恢复。
+        """
         return [
             item for item in self.state.get("products", [])
-            if item.get("status") in [self.STATUS_PENDING, self.STATUS_FAILED]
+            if item.get("status") in [
+                self.STATUS_PENDING,
+                self.STATUS_FAILED,
+                self.STATUS_RUNNING,
+            ]
         ]
+
+    def get_unfinished_urls(self) -> list[str]:
+        urls = []
+
+        for item in self.get_pending_products():
+            url = item.get("url", "")
+            if url and url not in urls:
+                urls.append(url)
+
+        return urls
+
+    def is_finished(self) -> bool:
+        return self.state.get("status") == self.STATUS_FINISHED
+
+    def is_resumed(self) -> bool:
+        return self.state.get("status") == self.STATUS_RESUMED
 
     def get_state_path(self) -> Path:
         return self.state_path
@@ -206,13 +247,66 @@ class TaskStateManager:
         data = json.loads(state_path.read_text(encoding="utf-8"))
 
         output_dir = state_path.parent.parent
+
         manager = cls(
             output_dir=output_dir,
             task_id=data.get("task_id"),
         )
+
         manager.state_path = state_path
         manager.state = data
+
         return manager
+
+    @classmethod
+    def find_latest_unfinished(
+        cls,
+        output_dir: str | Path = "output",
+    ) -> Path | None:
+        """
+        查找最近一个未完成任务状态文件。
+
+        忽略：
+            finished
+            resumed
+
+        未完成条件：
+            1. 顶层 status 不是 finished/resumed；
+            2. products 中仍有 pending / failed / running。
+        """
+        output_dir = Path(output_dir)
+        state_dir = output_dir / "任务状态"
+
+        if not state_dir.exists():
+            return None
+
+        files = sorted(
+            state_dir.glob("task_state_*.json"),
+            key=lambda p: p.stat().st_mtime,
+            reverse=True,
+        )
+
+        for path in files:
+            try:
+                manager = cls.load(path)
+                status = manager.state.get("status")
+
+                # 已完成或已经被恢复接管的任务，不再作为未完成任务返回
+                if status in [cls.STATUS_FINISHED, cls.STATUS_RESUMED]:
+                    continue
+
+                # 有待处理商品，认为可恢复
+                if manager.get_pending_products():
+                    return path
+
+                # 状态异常但未 finished/resumed，也保留恢复机会
+                if status not in [cls.STATUS_FINISHED, cls.STATUS_RESUMED]:
+                    return path
+
+            except Exception:
+                continue
+
+        return None
 
     # ------------------------------------------------------------------
     # 工具

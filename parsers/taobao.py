@@ -153,40 +153,50 @@ class TaobaoParser(BaseParser):
         """
         解析淘宝/天猫商品主图。
 
-        常见主图字段：
-        - auctionImages
-        - images
+        优化点：
+        1. 优先使用 auctionImages，这通常是真正的主图轮播；
+        2. 不优先使用 images 这种宽泛字段，避免混入详情图/营销图；
+        3. 主图限制数量，避免抓太多非主图。
         """
 
         urls = []
 
-        patterns = [
+        # ------------------------------------------------------------
+        # 1. 优先 auctionImages
+        # ------------------------------------------------------------
+        priority_patterns = [
             r'"auctionImages"\s*:\s*(\[[^\]]+\])',
-            r'"images"\s*:\s*(\[[^\]]+\])',
+            r'"auction_images"\s*:\s*(\[[^\]]+\])',
             r'"mainImages"\s*:\s*(\[[^\]]+\])',
+            r'"main_images"\s*:\s*(\[[^\]]+\])',
         ]
 
-        for pattern in patterns:
+        for pattern in priority_patterns:
             for match in re.findall(pattern, html, flags=re.S):
-                try:
-                    arr = json.loads(match)
-
-                    for item in arr:
-                        if isinstance(item, str):
-                            url = self._clean_js_url(item)
-                            urls.append(normalize_image_url(url))
-
-                        elif isinstance(item, dict):
-                            for key in ["url", "image", "picUrl", "imgUrl"]:
-                                if item.get(key):
-                                    url = self._clean_js_url(item[key])
-                                    urls.append(normalize_image_url(url))
-
-                except Exception:
-                    pass
+                urls.extend(self._extract_urls_from_json_array(match))
 
         urls = dedupe_urls(urls)
         urls = self._filter_product_images(urls)
+
+        # ------------------------------------------------------------
+        # 2. 如果优先字段没取到，再有限兜底 images
+        # ------------------------------------------------------------
+        if not urls:
+            fallback_patterns = [
+                r'"images"\s*:\s*(\[[^\]]+\])',
+                r'"picGallery"\s*:\s*(\[[^\]]+\])',
+                r'"gallery"\s*:\s*(\[[^\]]+\])',
+            ]
+
+            for pattern in fallback_patterns:
+                for match in re.findall(pattern, html, flags=re.S):
+                    urls.extend(self._extract_urls_from_json_array(match))
+
+            urls = dedupe_urls(urls)
+            urls = self._filter_product_images(urls)
+
+        # 主图一般 5~12 张，避免异常字段混入太多
+        urls = urls[:12]
 
         return [
             ImageItem(
@@ -197,6 +207,55 @@ class TaobaoParser(BaseParser):
             )
             for u in urls
         ]
+        
+        
+    def _extract_urls_from_json_array(self, text: str) -> list[str]:
+        """
+        从 JSON 数组中提取图片 URL。
+
+        兼容：
+            ["//xxx.jpg", "..."]
+            [{"url":"..."}, {"picUrl":"..."}]
+        """
+        urls = []
+
+        if not text:
+            return urls
+
+        try:
+            arr = json.loads(text)
+
+            for item in arr:
+                if isinstance(item, str):
+                    url = self._clean_js_url(item)
+                    url = normalize_image_url(url)
+                    if url:
+                        urls.append(url)
+
+                elif isinstance(item, dict):
+                    for key in [
+                        "url",
+                        "image",
+                        "picUrl",
+                        "imgUrl",
+                        "imageUrl",
+                        "src",
+                        "thumbUrl",
+                        "hdUrl",
+                    ]:
+                        value = item.get(key)
+                        if value:
+                            url = self._clean_js_url(value)
+                            url = normalize_image_url(url)
+                            if url:
+                                urls.append(url)
+
+        except Exception:
+            pass
+
+        return urls
+
+
 
     # ----------------------------------------------------------------------
     # 详情图解析
@@ -254,126 +313,216 @@ class TaobaoParser(BaseParser):
         """
         从淘宝/天猫页面中提取详情接口 descUrl。
 
-        常见字段：
-        - "descUrl":"//dscnew.taobao.com/..."
-        - "httpsDescUrl":"https://..."
-        - descUrl: '//...'
+        兼容：
+            "descUrl":"//..."
+            "httpsDescUrl":"https://..."
+            descUrl: '//...'
+            descUrl: "..."
+            desc_url: "..."
         """
+        if not html:
+            return ""
+
+        text = self._decode_text(html)
 
         patterns = [
             r'"descUrl"\s*:\s*"([^"]+)"',
             r'"httpsDescUrl"\s*:\s*"([^"]+)"',
+            r'"desc_url"\s*:\s*"([^"]+)"',
             r"'descUrl'\s*:\s*'([^']+)'",
             r"descUrl\s*:\s*'([^']+)'",
             r'descUrl\s*:\s*"([^"]+)"',
-            r'"desc_url"\s*:\s*"([^"]+)"',
+            r'httpsDescUrl\s*:\s*"([^"]+)"',
+            r'(https?:)?//(?:dsc|desc|assets|g\.alicdn|img)\S+?(?:desc|itemdesc|detail)\S*',
         ]
 
         for pattern in patterns:
-            match = re.search(pattern, html, flags=re.S)
-            if match:
-                url = match.group(1)
-                url = self._clean_js_url(url)
-                url = normalize_image_url(url)
-                return url
+            for match in re.findall(pattern, text, flags=re.I | re.S):
+                if isinstance(match, tuple):
+                    raw = "".join(match)
+                else:
+                    raw = match
+
+                raw = self._clean_js_url(raw)
+                raw = raw.strip().strip('"').strip("'")
+
+                if not raw:
+                    continue
+
+                if raw.startswith("//"):
+                    raw = "https:" + raw
+
+                if raw.startswith("http"):
+                    lower = raw.lower()
+
+                    bad_words = [
+                        "login",
+                        "passport",
+                        "cart",
+                        "order",
+                        "trade",
+                        "pay",
+                        "rate",
+                        "review",
+                    ]
+
+                    if any(w in lower for w in bad_words):
+                        continue
+
+                    return raw
 
         return ""
 
+
     def _fetch_desc_html(self, desc_url: str) -> str:
         """
-        请求淘宝/天猫详情接口，返回详情 HTML。
+        请求淘宝/天猫详情接口 HTML。
 
-        descUrl 返回的一般是真正的商品详情内容，比整页 HTML 精准很多。
+        注意：
+            请求头必须为纯 ASCII，不能包含中文。
         """
+        if not desc_url:
+            return ""
+
+        desc_url = self._clean_js_url(desc_url)
+
+        if desc_url.startswith("//"):
+            desc_url = "https:" + desc_url
 
         headers = {
             "User-Agent": (
                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                 "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/120.0 Safari/537.36"
+                "Chrome/124.0.0.0 Safari/537.36"
             ),
             "Referer": "https://detail.tmall.com/",
             "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-            "Accept-Language": "zh-CN,zh;q=0.9",
+            "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
         }
 
-        with httpx.Client(timeout=20, follow_redirects=True) as client:
-            response = client.get(desc_url, headers=headers)
+        with httpx.Client(timeout=20, follow_redirects=True, headers=headers) as client:
+            response = client.get(desc_url)
+            response.raise_for_status()
 
-        if response.status_code != 200:
-            raise RuntimeError(f"详情接口请求失败，状态码：{response.status_code}")
+            text = response.text or ""
 
-        text = response.text
+            # 有些接口返回编码识别不准，做一次兜底
+            if not text and response.content:
+                try:
+                    text = response.content.decode("utf-8", errors="ignore")
+                except Exception:
+                    text = ""
 
-        # HTML 反转义
-        text = html_lib.unescape(text)
+            return text
 
-        # 有些接口返回 JS 包裹内容，例如：
-        # var desc='...';
-        # callback(...)
-        # 这里不强制截取，后面统一用 BeautifulSoup 和正则解析。
-        return text
 
     def _parse_detail_images_from_desc_html(self, desc_html: str) -> list[str]:
         """
-        从详情接口返回的 HTML 中提取详情图。
+        从 descUrl 返回内容中提取详情图。
+
+        兼容：
+            1. 直接 HTML；
+            2. var desc='...';
+            3. JSON/JSONP content 字段；
+            4. 转义字符串；
+            5. img/data-src/srcset/background-image。
         """
+        if not desc_html:
+            return []
+
+        text = self._decode_text(desc_html)
+
+        content_candidates = []
+
+        # ------------------------------------------------------------
+        # 1. 提取常见字段
+        # ------------------------------------------------------------
+        patterns = [
+            r'var\s+desc\s*=\s*[\'"](.+?)[\'"]\s*;',
+            r'"content"\s*:\s*"(.+?)"\s*(?:,\s*"|\})',
+            r"'content'\s*:\s*'(.+?)'\s*(?:,\s*'|\})",
+            r'"desc"\s*:\s*"(.+?)"\s*(?:,\s*"|\})',
+            r"'desc'\s*:\s*'(.+?)'\s*(?:,\s*'|\})",
+            r'"detailContent"\s*:\s*"(.+?)"\s*(?:,\s*"|\})',
+            r'"apiStack"\s*:\s*(\[[\s\S]+?\])',
+        ]
+
+        for pattern in patterns:
+            for match in re.findall(pattern, text, flags=re.I | re.S):
+                if match:
+                    content_candidates.append(match)
+
+        # 无论是否匹配到字段，都加入完整返回体兜底
+        content_candidates.append(text)
 
         urls = []
 
-        soup = BeautifulSoup(desc_html, "lxml")
+        for content in content_candidates:
+            content = self._decode_text(content)
+            content = content.replace('\\"', '"')
+            content = content.replace("\\'", "'")
+            content = content.replace("\\n", "\n")
+            content = content.replace("\\r", "\r")
+            content = content.replace("\\t", "\t")
 
-        # 详情接口里的 img 通常比较干净
-        for img in soup.select("img"):
-            src = (
-                img.get("data-src")
-                or img.get("data-ks-lazyload")
-                or img.get("data-lazyload")
-                or img.get("data-original")
-                or img.get("src")
-            )
+            try:
+                soup = BeautifulSoup(content, "lxml")
+            except Exception:
+                soup = BeautifulSoup(content, "html.parser")
 
-            if src:
-                src = self._clean_js_url(src)
-                urls.append(normalize_image_url(src))
+            # --------------------------------------------------------
+            # img 标签
+            # --------------------------------------------------------
+            for img in soup.find_all("img"):
+                for attr in [
+                    "src",
+                    "data-src",
+                    "data-original",
+                    "data-lazy-src",
+                    "data-ks-lazyload",
+                    "data-img",
+                    "data-url",
+                    "data-lazyload",
+                    "srcset",
+                    "data-srcset",
+                ]:
+                    value = img.get(attr)
+                    if not value:
+                        continue
 
-        # 部分详情图可能在 style background-image 中
-        style_patterns = [
-            r'background-image\s*:\s*url\(["\']?(.*?)["\']?\)',
-            r'background\s*:\s*url\(["\']?(.*?)["\']?\)',
-        ]
+                    if attr in ["srcset", "data-srcset"]:
+                        for part in value.split(","):
+                            u = part.strip().split(" ")[0]
+                            if u:
+                                urls.append(u)
+                    else:
+                        urls.append(value)
 
-        for pattern in style_patterns:
-            for src in re.findall(pattern, desc_html, flags=re.I | re.S):
-                if src:
-                    src = self._clean_js_url(src)
-                    urls.append(normalize_image_url(src))
+            # --------------------------------------------------------
+            # background-image
+            # --------------------------------------------------------
+            urls.extend(self._extract_background_image_urls(content))
 
-        # 有些接口返回字符串中包含转义后的 img
-        regex_patterns = [
-            r'<img[^>]+src=["\'](//[^"\']+\.(?:jpg|jpeg|png|webp)[^"\']*)["\']',
-            r'<img[^>]+data-src=["\'](//[^"\']+\.(?:jpg|jpeg|png|webp)[^"\']*)["\']',
-            r'data-ks-lazyload=["\'](//[^"\']+\.(?:jpg|jpeg|png|webp)[^"\']*)["\']',
-            r'(//[^"\'>\s]+\.(?:jpg|jpeg|png|webp)[^"\'>\s]*)',
-        ]
+            # --------------------------------------------------------
+            # 正则全文提取
+            # --------------------------------------------------------
+            urls.extend(self._extract_image_urls_from_text(content))
 
-        for pattern in regex_patterns:
-            for src in re.findall(pattern, desc_html, flags=re.I | re.S):
-                if src:
-                    src = self._clean_js_url(src)
-                    urls.append(normalize_image_url(src))
+        urls = [self._clean_js_url(u) for u in urls if u]
+        urls = [normalize_image_url(u) for u in urls if u]
+        urls = dedupe_urls(urls)
+        urls = self._filter_detail_images(urls)
 
-        return dedupe_urls(urls)
+        return urls
+
 
     def _parse_detail_images_from_containers(self, soup: BeautifulSoup) -> list[str]:
         """
-        从页面详情区域容器中提取详情图。
+        从页面详情容器中提取详情图。
 
         注意：
-        这里不再使用 soup.select("img") 全局抓图。
-        只允许从疑似详情容器里抓。
+            只扫描详情容器，不扫描整页。
         """
-
         urls = []
 
         detail_container_selectors = [
@@ -382,58 +531,80 @@ class TaobaoParser(BaseParser):
             "#J_Detail",
             "#J_Desc",
             "#J_DetailMeta",
-            "#attributes",
+            "#J_DetailInside",
             ".tb-detail-bd",
             ".tb-desc",
             ".descV8-container",
             ".detail-content",
             ".item-detail",
             ".content-detail",
-            ".rax-view-v2",
-            ".MainContent--mainContent",
             ".ItemDetail--content",
+            "[class*=desc]",
+            "[class*=Desc]",
+            "[class*=detail]",
+            "[class*=Detail]",
         ]
 
-        containers = []
-
         for selector in detail_container_selectors:
-            found = soup.select(selector)
-            if found:
-                containers.extend(found)
+            try:
+                containers = soup.select(selector)
+            except Exception:
+                containers = []
 
-        # 如果没有找到详情容器，直接返回空，不做整页 img 扫描
-        if not containers:
-            return []
+            for container in containers:
+                html = str(container)
 
-        for container in containers:
-            for img in container.select("img"):
-                src = (
-                    img.get("data-src")
-                    or img.get("data-ks-lazyload")
-                    or img.get("data-lazyload")
-                    or img.get("data-original")
-                    or img.get("src")
-                )
+                # 排除明显非详情区域
+                lower_html = html.lower()
+                bad_area_words = [
+                    "recommend",
+                    "related",
+                    "shop",
+                    "seller",
+                    "comment",
+                    "rate",
+                    "review",
+                    "footer",
+                    "header",
+                    "navbar",
+                ]
 
-                if src:
-                    src = self._clean_js_url(src)
-                    urls.append(normalize_image_url(src))
+                if any(w in lower_html for w in bad_area_words):
+                    continue
 
-            # 详情容器里有时也有 background-image
-            html = str(container)
+                for img in container.find_all("img"):
+                    for attr in [
+                        "src",
+                        "data-src",
+                        "data-original",
+                        "data-lazy-src",
+                        "data-ks-lazyload",
+                        "data-img",
+                        "data-url",
+                        "data-lazyload",
+                        "srcset",
+                        "data-srcset",
+                    ]:
+                        value = img.get(attr)
+                        if not value:
+                            continue
 
-            style_patterns = [
-                r'background-image\s*:\s*url\(["\']?(.*?)["\']?\)',
-                r'background\s*:\s*url\(["\']?(.*?)["\']?\)',
-            ]
+                        if attr in ["srcset", "data-srcset"]:
+                            for part in value.split(","):
+                                u = part.strip().split(" ")[0]
+                                if u:
+                                    urls.append(u)
+                        else:
+                            urls.append(value)
 
-            for pattern in style_patterns:
-                for src in re.findall(pattern, html, flags=re.I | re.S):
-                    if src:
-                        src = self._clean_js_url(src)
-                        urls.append(normalize_image_url(src))
+                urls.extend(self._extract_background_image_urls(html))
 
-        return dedupe_urls(urls)
+        urls = [self._clean_js_url(u) for u in urls if u]
+        urls = [normalize_image_url(u) for u in urls if u]
+        urls = dedupe_urls(urls)
+
+        return urls
+
 
     # ----------------------------------------------------------------------
     # SKU 图解析
@@ -529,61 +700,46 @@ class TaobaoParser(BaseParser):
 
     def _filter_detail_images(self, urls: list[str]) -> list[str]:
         """
-        过滤明显不属于商品详情图的图片。
+        过滤详情图。
 
-        主要过滤：
-        - 天猫/淘宝 Logo
-        - 店铺图标
-        - 会员图标
-        - 认证/备案图标
-        - sprite/icon
-        - qrcode
-        - avatar
-        - 装饰性小图
+        详情图允许营销图、参数图、长图；
+        只过滤明显 UI、店铺、logo、头像、二维码、推荐商品等。
         """
-
         result = []
 
-        blacklist_keywords = [
-            # logo/icon/sprite
+        blacklist = [
             "logo",
             "icon",
-            "sprite",
-            "tb-logo",
-
-            # 注意：这里不要简单过滤 tmall/taobao，
-            # 因为很多商品详情图本身 CDN 域名可能包含 taobao/tmall。
-            # 所以这里不加入 "tmall" 和 "taobao"。
-
-            # 店铺和账号相关
-            "shop",
-            "store",
-            "seller",
             "avatar",
-            "wangwang",
-
-            # 二维码/认证/备案
             "qrcode",
-            "qr-code",
-            "beian",
-            "police",
-            "gongshang",
-            "cert",
-            "license",
-            "credit",
-
-            # 会员/服务/装饰图
-            "vip",
-            "service",
-            "promise",
-            "guarantee",
-            "badge",
-            "medal",
-
-            # 广告/推荐
-            "ad",
-            "banner",
+            "qr_code",
+            "sprite",
+            "loading",
+            "placeholder",
+            "default",
+            "transparent",
+            "blank",
+            "shop",
+            "seller",
+            "store",
+            "wangwang",
+            "aliww",
+            "tmall.com/favicon",
+            "taobao.com/favicon",
+            "member",
+            "rate",
+            "review",
+            "comment",
             "recommend",
+            "related",
+            "footer",
+            "header",
+            "service",
+            "certificate",
+            "license",
+            "auth",
+            "coupon",
+            "activity",
             "promotion",
         ]
 
@@ -593,21 +749,35 @@ class TaobaoParser(BaseParser):
 
             lower = url.lower()
 
-            # 必须是常见图片格式
             if not any(ext in lower for ext in [".jpg", ".jpeg", ".png", ".webp"]):
                 continue
 
-            # 过滤明显无关图片
-            if any(keyword in lower for keyword in blacklist_keywords):
+            if any(bad in lower for bad in blacklist):
                 continue
 
-            # 过滤明显小图标
-            if self._looks_like_small_icon(lower):
+            # 过滤明显小尺寸
+            small_patterns = [
+                "16x16",
+                "24x24",
+                "30x30",
+                "32x32",
+                "40x40",
+                "48x48",
+                "50x50",
+                "60x60",
+                "64x64",
+                "80x80",
+                "100x100",
+                "120x120",
+            ]
+
+            if any(p in lower for p in small_patterns):
                 continue
 
             result.append(url)
 
         return dedupe_urls(result)
+
 
     def _looks_like_small_icon(self, url: str) -> bool:
         """
@@ -632,6 +802,38 @@ class TaobaoParser(BaseParser):
                 return True
 
         return False
+        
+    def _decode_text(self, text: str) -> str:
+        """
+        安全解码文本。
+
+        注意：
+        不要对整段 HTML 使用 unicode_escape，
+        否则正常中文可能变成乱码。
+        """
+        if not text:
+            return ""
+
+        try:
+            text = html_lib.unescape(text)
+        except Exception:
+            pass
+
+        text = text.replace("\\/", "/")
+        text = text.replace("\\u002F", "/")
+        text = text.replace("\\u002f", "/")
+        text = text.replace("&amp;", "&")
+
+        def replace_unicode(match):
+            try:
+                return chr(int(match.group(1), 16))
+            except Exception:
+                return match.group(0)
+
+        text = re.sub(r"\\u([0-9a-fA-F]{4})", replace_unicode, text)
+
+        return text
+
 
     def _clean_js_url(self, url: str) -> str:
         """
@@ -660,3 +862,52 @@ class TaobaoParser(BaseParser):
                 self.browser.log_callback(message)
         except Exception:
             pass
+            
+            
+    def _extract_background_image_urls(self, text: str) -> list[str]:
+        """
+        提取 background-image:url(...) 中的图片。
+        """
+        if not text:
+            return []
+
+        text = self._decode_text(text)
+
+        urls = []
+
+        patterns = [
+            r'background-image\s*:\s*url\(["\']?([^"\')]+)["\']?\)',
+            r'background\s*:\s*url\(["\']?([^"\')]+)["\']?\)',
+            r'url\(["\']?((?:https?:)?//[^"\')]+?\.(?:jpg|jpeg|png|webp)[^"\')]*)["\']?\)',
+        ]
+
+        for pattern in patterns:
+            for m in re.finditer(pattern, text, re.I):
+                urls.append(m.group(1))
+
+        return urls
+
+    def _extract_image_urls_from_text(self, text: str) -> list[str]:
+        """
+        从文本中提取图片 URL。
+        """
+        if not text:
+            return []
+
+        text = self._decode_text(text)
+
+        urls = []
+
+        patterns = [
+            r'(?:https?:)?//[^"\'\s<>\\]+?\.(?:jpg|jpeg|png|webp)(?:\?[^"\'\s<>\\]*)?',
+            r'(?:https?:)?//[^"\'\s<>\\]+?\.jpg_[^"\'\s<>\\]+',
+            r'(?:https?:)?//[^"\'\s<>\\]+?\.jpeg_[^"\'\s<>\\]+',
+            r'(?:https?:)?//[^"\'\s<>\\]+?\.png_[^"\'\s<>\\]+',
+            r'(?:https?:)?//[^"\'\s<>\\]+?\.webp_[^"\'\s<>\\]+',
+        ]
+
+        for pattern in patterns:
+            for m in re.finditer(pattern, text, re.I):
+                urls.append(m.group(0))
+
+        return urls
