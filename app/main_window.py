@@ -113,10 +113,13 @@ class MainWindow(QMainWindow):
         self.main_count_label = QLabel("主图：- 张")
         self.detail_count_label = QLabel("详情图：- 张")
         self.sku_count_label = QLabel("SKU图：- 张")
+        self.review_count_label = QLabel("评价媒体：-")
+
 
         row1.addWidget(self.main_count_label)
         row1.addWidget(self.detail_count_label)
         row1.addWidget(self.sku_count_label)
+        row1.addWidget(self.review_count_label)
         row1.addStretch()
 
         row2 = QHBoxLayout()
@@ -124,16 +127,19 @@ class MainWindow(QMainWindow):
         self.main_checkbox = QCheckBox("下载主图")
         self.detail_checkbox = QCheckBox("下载详情图")
         self.sku_checkbox = QCheckBox("下载SKU图")
+        self.review_media_checkbox = QCheckBox("下载评价图/视频")
         self.high_quality_checkbox = QCheckBox("尽量下载高清图")
 
         self.main_checkbox.setChecked(self.config.download_main)
         self.detail_checkbox.setChecked(self.config.download_detail)
         self.sku_checkbox.setChecked(self.config.download_sku)
+        self.review_media_checkbox.setChecked(self.config.download_review_media)
         self.high_quality_checkbox.setChecked(self.config.high_quality)
 
         row2.addWidget(self.main_checkbox)
         row2.addWidget(self.detail_checkbox)
         row2.addWidget(self.sku_checkbox)
+        row2.addWidget(self.review_media_checkbox)
         row2.addWidget(self.high_quality_checkbox)
         row2.addStretch()
 
@@ -217,12 +223,25 @@ class MainWindow(QMainWindow):
         self.min_height_spinbox.setValue(self.config.min_image_height)
         self.min_height_spinbox.setSuffix(" px")
 
+        self.review_limit_label = QLabel("评价上限：")
+        self.review_limit_spinbox = QSpinBox()
+        self.review_limit_spinbox.setRange(1, 500)
+        self.review_limit_spinbox.setValue(self.config.review_limit)
+        self.review_limit_spinbox.setSuffix(" 条")
+
+        self.review_include_video_checkbox = QCheckBox("采集评价视频")
+        self.review_include_video_checkbox.setChecked(self.config.review_include_video)
+
         settings_row3.addWidget(self.filter_small_images_checkbox)
         settings_row3.addWidget(self.min_width_label)
         settings_row3.addWidget(self.min_width_spinbox)
         settings_row3.addWidget(self.min_height_label)
         settings_row3.addWidget(self.min_height_spinbox)
+        settings_row3.addWidget(self.review_limit_label)
+        settings_row3.addWidget(self.review_limit_spinbox)
+        settings_row3.addWidget(self.review_include_video_checkbox)
         settings_row3.addStretch()
+
 
         settings_row4 = QHBoxLayout()
 
@@ -324,7 +343,9 @@ class MainWindow(QMainWindow):
         self.main_checkbox.stateChanged.connect(self.save_current_config)
         self.detail_checkbox.stateChanged.connect(self.save_current_config)
         self.sku_checkbox.stateChanged.connect(self.save_current_config)
+        self.review_media_checkbox.stateChanged.connect(self.save_current_config)
         self.high_quality_checkbox.stateChanged.connect(self.save_current_config)
+
 
         self.timeout_spinbox.valueChanged.connect(self.save_current_config)
         self.retries_spinbox.valueChanged.connect(self.save_current_config)
@@ -340,6 +361,10 @@ class MainWindow(QMainWindow):
         self.min_width_spinbox.valueChanged.connect(self.save_current_config)
         self.min_height_spinbox.valueChanged.connect(self.save_current_config)
 
+        self.review_limit_spinbox.valueChanged.connect(self.save_current_config)
+        self.review_include_video_checkbox.stateChanged.connect(self.save_current_config)
+
+
     def choose_path(self):
         path = QFileDialog.getExistingDirectory(self, "选择保存目录")
         if path:
@@ -352,6 +377,7 @@ class MainWindow(QMainWindow):
             self.config.download_main = self.main_checkbox.isChecked()
             self.config.download_detail = self.detail_checkbox.isChecked()
             self.config.download_sku = self.sku_checkbox.isChecked()
+            self.config.download_review_media = self.review_media_checkbox.isChecked()
             self.config.high_quality = self.high_quality_checkbox.isChecked()
 
             self.config.download_timeout = self.timeout_spinbox.value()
@@ -369,6 +395,10 @@ class MainWindow(QMainWindow):
             self.config.filter_small_images = self.filter_small_images_checkbox.isChecked()
             self.config.min_image_width = self.min_width_spinbox.value()
             self.config.min_image_height = self.min_height_spinbox.value()
+            
+            self.config.review_limit = self.review_limit_spinbox.value()
+            self.config.review_include_video = self.review_include_video_checkbox.isChecked()
+
 
             self.config.save()
 
@@ -1165,11 +1195,16 @@ class MainWindow(QMainWindow):
             "sku": self.sku_checkbox.isChecked(),
         }
 
+        download_review_media = self.review_media_checkbox.isChecked()
+        review_limit = self.review_limit_spinbox.value()
+        review_include_video = self.review_include_video_checkbox.isChecked()
+
         high_quality = self.high_quality_checkbox.isChecked()
 
-        if not any(selected_types.values()):
-            QMessageBox.warning(self, "提示", "请至少选择一种需要下载的图片类型。")
+        if not any(selected_types.values()) and not download_review_media:
+            QMessageBox.warning(self, "提示", "请至少选择一种需要下载的内容。")
             return
+
 
         total_selected_images = 0
         for product in self.products:
@@ -1180,7 +1215,7 @@ class MainWindow(QMainWindow):
             if selected_types["sku"]:
                 total_selected_images += len(product.sku_images)
 
-        if total_selected_images == 0:
+        if total_selected_images == 0 and not download_review_media:
             QMessageBox.warning(
                 self,
                 "提示",
@@ -1226,7 +1261,13 @@ class MainWindow(QMainWindow):
             filter_small_images_enabled=self.filter_small_images_checkbox.isChecked(),
             min_image_width=self.min_width_spinbox.value(),
             min_image_height=self.min_height_spinbox.value(),
+            download_review_media=download_review_media,
+            review_limit=review_limit,
+            review_include_video=review_include_video,
+            headless=self.headless_checkbox.isChecked(),
+            login_wait_seconds=self.login_wait_spinbox.value(),
         )
+
 
         self.download_worker.log_signal.connect(self.log)
         self.download_worker.progress_signal.connect(self.progress_bar.setValue)
@@ -1241,18 +1282,37 @@ class MainWindow(QMainWindow):
         self.last_product_dir = last_product_dir
         self.open_dir_button.setEnabled(True)
 
+        review_summary = None
+
         if isinstance(payload, dict):
             result = payload.get("result")
             self.last_retry_items = payload.get("retry_items", []) or []
+            review_summary = payload.get("review_summary")
         else:
             result = payload
             self.last_retry_items = []
 
+
         self.retry_failed_button.setEnabled(bool(self.last_retry_items))
 
         retry_text = ""
+        
         if self.last_retry_items:
             retry_text = f"\n失败图片可重试：{len(self.last_retry_items)} 张"
+            
+        review_text = ""
+
+        if review_summary and review_summary.get("enabled"):
+            review_text = (
+                f"\n\n评价图/视频采集："
+                f"\n支持商品：{review_summary.get('supported_product_count', 0)} 个"
+                f"\n评价条数：{review_summary.get('review_count', 0)} 条"
+                f"\n评价图片：成功 {review_summary.get('image_success', 0)} / "
+                f"{review_summary.get('image_total', 0)}"
+                f"\n评价视频：成功 {review_summary.get('video_success', 0)} / "
+                f"{review_summary.get('video_total', 0)}"
+            )
+
 
         QMessageBox.information(
             self,
@@ -1266,7 +1326,8 @@ class MainWindow(QMainWindow):
             f"格式转换成功：{result.converted_count} 张\n"
             f"格式转换失败：{result.convert_failed} 张\n"
             f"小图过滤：{result.small_filtered_count} 张"
-            f"{retry_text}",
+            f"{retry_text}"
+            f"{review_text}",
         )
 
     def on_download_stopped(self, payload):
@@ -1498,6 +1559,8 @@ class MainWindow(QMainWindow):
         self.main_count_label.setText("主图：- 张")
         self.detail_count_label.setText("详情图：- 张")
         self.sku_count_label.setText("SKU图：- 张")
+        self.review_count_label.setText("评价媒体：-")
+
 
     def _refresh_product_info_display(self):
         if not self.products:
@@ -1515,11 +1578,23 @@ class MainWindow(QMainWindow):
             self.detail_count_label.setText(f"详情图：{len(product.detail_images)} 张")
             self.sku_count_label.setText(f"SKU图：{len(product.sku_images)} 张")
 
+            if product.platform in ["taobao", "tmall"]:
+                self.review_count_label.setText("评价媒体：下载时采集")
+            else:
+                self.review_count_label.setText("评价媒体：仅淘宝/天猫")
+
             return
+
 
         total_main = sum(len(p.main_images) for p in self.products)
         total_detail = sum(len(p.detail_images) for p in self.products)
         total_sku = sum(len(p.sku_images) for p in self.products)
+        
+        review_supported_count = sum(
+            1 for p in self.products
+            if p.platform in ["taobao", "tmall"]
+        )
+
 
         platforms = sorted(set(p.platform for p in self.products))
 
@@ -1530,6 +1605,9 @@ class MainWindow(QMainWindow):
         self.main_count_label.setText(f"主图：{total_main} 张")
         self.detail_count_label.setText(f"详情图：{total_detail} 张")
         self.sku_count_label.setText(f"SKU图：{total_sku} 张")
+        
+        self.review_count_label.setText(f"评价媒体：{review_supported_count} 个商品支持")
+
 
     def _get_image_format_combo_value(self) -> str:
         if not hasattr(self, "image_format_combo"):
@@ -1850,6 +1928,7 @@ class MainWindow(QMainWindow):
         兼容不同版本 main_window.py 里的保存路径控件命名。
         """
         candidates = [
+            "path_input"
             "save_dir_input",
             "save_path_input",
             "output_dir_input",

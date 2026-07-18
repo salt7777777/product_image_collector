@@ -14,5 +14,8 @@
   "image_output_format": "original",
   "filter_small_images": true,
   "min_image_width": 300,
-  "min_image_height": 300
+  "min_image_height": 300,
+  "download_review_media": true,
+  "review_limit": 50,
+  "review_include_video": true
 }

@@ -118,3 +118,55 @@ class DownloadResult:
         if self.total == 0:
             return 0.0
         return round(self.success / self.total * 100, 2)
+
+@dataclass
+class ReviewMedia:
+    """
+    评价媒体资源。
+    """
+
+    url: str
+    media_type: str  # image / video
+    ext: str = ""
+    local_path: str = ""
+    download_success: bool = False
+    download_reason: str = ""
+    source: str = ""
+
+
+@dataclass
+class ReviewItem:
+    """
+    单条评价数据。
+    """
+
+    index: int = 0
+    user_name: str = ""
+    content: str = ""
+    sku_info: str = ""
+    date: str = ""
+    like_count: int = 0
+    source: str = ""
+
+    images: list[ReviewMedia] = field(default_factory=list)
+    videos: list[ReviewMedia] = field(default_factory=list)
+
+
+@dataclass
+class ReviewDownloadSummary:
+    """
+    评价媒体采集/下载统计。
+    """
+
+    enabled: bool = False
+    product_count: int = 0
+    supported_product_count: int = 0
+    review_count: int = 0
+
+    image_total: int = 0
+    image_success: int = 0
+    image_failed: int = 0
+
+    video_total: int = 0
+    video_success: int = 0
+    video_failed: int = 0

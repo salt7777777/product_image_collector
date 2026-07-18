@@ -38,6 +38,12 @@ class AppConfig:
     filter_small_images: bool = False
     min_image_width: int = 300
     min_image_height: int = 300
+    
+    # 淘宝/天猫评价图/视频采集
+    download_review_media: bool = False
+    review_limit: int = 50
+    review_include_video: bool = True
+
 
     @classmethod
     def load(cls) -> "AppConfig":

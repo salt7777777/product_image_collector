@@ -10,7 +10,15 @@ from core.image_link_reporter import ImageLinkReportExporter
 from core.parse_cache import ParseCache
 from core.local_file_reporter import LocalFileReportExporter
 from core.task_state import TaskStateManager
-from core.models import DownloadResult, DuplicateImage, ConvertedImage, SmallImage
+from core.models import (
+    DownloadResult,
+    DuplicateImage,
+    ConvertedImage,
+    SmallImage,
+)
+from parsers.taobao_review import TaobaoReviewParser
+from core.media_downloader import MediaDownloader
+from core.review_reporter import ReviewReportExporter
 from parsers import get_parser
 from utils.file_hash import dedupe_image_files
 from utils.image_converter import convert_image_files
@@ -252,7 +260,13 @@ class BatchDownloadWorker(QThread):
         filter_small_images_enabled: bool = False,
         min_image_width: int = 300,
         min_image_height: int = 300,
+        download_review_media: bool = False,
+        review_limit: int = 50,
+        review_include_video: bool = True,
+        headless: bool = False,
+        login_wait_seconds: int = 180,
     ):
+
         super().__init__()
         self.products = products or []
         self.base_dir = base_dir
@@ -269,6 +283,13 @@ class BatchDownloadWorker(QThread):
         self.filter_small_images_enabled = filter_small_images_enabled
         self.min_image_width = min_image_width
         self.min_image_height = min_image_height
+        
+        self.download_review_media = download_review_media
+        self.review_limit = review_limit
+        self.review_include_video = review_include_video
+        self.headless = headless
+        self.login_wait_seconds = login_wait_seconds
+
 
         self.retry_items = []
         self._stop_requested = False
@@ -308,6 +329,20 @@ class BatchDownloadWorker(QThread):
             aggregate_result = DownloadResult(total=total_images)
             last_product_dir = None
             batch_items = []
+
+            review_summary = {
+                "enabled": self.download_review_media,
+                "product_count": len(self.products),
+                "supported_product_count": 0,
+                "review_count": 0,
+                "image_total": 0,
+                "image_success": 0,
+                "image_failed": 0,
+                "video_total": 0,
+                "video_success": 0,
+                "video_failed": 0,
+            }
+
 
             if total_products == 1:
                 self.log_signal.emit("开始创建商品文件夹...")
@@ -592,7 +627,18 @@ class BatchDownloadWorker(QThread):
                 aggregate_result.small_filtered_count += result.small_filtered_count
                 aggregate_result.small_filter_failed += result.small_filter_failed
                 aggregate_result.small_image_items.extend(result.small_image_items)
-
+                
+                # ------------------------------------------------------------
+                # 淘宝/天猫评价图/视频采集
+                # ------------------------------------------------------------
+                if self.download_review_media and not self.is_stop_requested():
+                    item_review_summary = self._collect_and_download_review_media(
+                        product=product,
+                        product_dir=product_dir,
+                        prefix=prefix,
+                    )
+                    self._merge_review_summary(review_summary, item_review_summary)
+                
                 TaskLogger.save_log(
                     product_dir=product_dir,
                     product=product,
@@ -796,8 +842,10 @@ class BatchDownloadWorker(QThread):
                 {
                     "result": aggregate_result,
                     "retry_items": self.retry_items,
+                    "review_summary": review_summary,
                 },
             )
+
 
         except Exception as e:
             try:
@@ -810,7 +858,138 @@ class BatchDownloadWorker(QThread):
             self.error_signal.emit(f"下载失败：{e}")
 
 
+    def _collect_and_download_review_media(
+        self,
+        product,
+        product_dir: Path,
+        prefix: str,
+    ) -> dict:
+        """
+        采集并下载淘宝/天猫评价图/视频。
+        """
+        summary = {
+            "supported_product_count": 0,
+            "review_count": 0,
+            "image_total": 0,
+            "image_success": 0,
+            "image_failed": 0,
+            "video_total": 0,
+            "video_success": 0,
+            "video_failed": 0,
+        }
 
+        if product.platform not in ["taobao", "tmall"]:
+            self.log_signal.emit(
+                f"{prefix} 评价图/视频采集仅支持淘宝/天猫，当前平台 {product.platform} 已跳过。"
+            )
+            return summary
+
+        summary["supported_product_count"] = 1
+
+        try:
+            self.log_signal.emit(
+                f"{prefix} 开始采集淘宝/天猫评价图/视频，最多 {self.review_limit} 条..."
+            )
+
+            parser = TaobaoReviewParser(
+                platform=product.platform,
+                headless=self.headless,
+                login_wait_seconds=self.login_wait_seconds,
+                log_callback=lambda msg: self.log_signal.emit(f"{prefix} {msg}"),
+            )
+
+            reviews = parser.parse_reviews(
+                url=product.url,
+                limit=self.review_limit,
+                include_video=self.review_include_video,
+                cancel_callback=self.is_stop_requested,
+            )
+
+            if self.is_stop_requested():
+                return summary
+
+            if not reviews:
+                self.log_signal.emit(f"{prefix} 未采集到有图/视频评价。")
+                return summary
+
+            review_image_dir = product_dir / "评价图"
+            review_video_dir = product_dir / "评价视频"
+
+            downloader = MediaDownloader(
+                timeout=self.download_timeout,
+                retries=self.download_retries,
+                delay=0.25,
+                retry_delay=0.5,
+            )
+
+            media_summary = downloader.download_review_media(
+                reviews=reviews,
+                image_dir=review_image_dir,
+                video_dir=review_video_dir,
+                include_video=self.review_include_video,
+                log_callback=lambda msg: self.log_signal.emit(f"{prefix} {msg}"),
+                cancel_callback=self.is_stop_requested,
+            )
+
+            summary["review_count"] = media_summary.get("review_count", len(reviews))
+            summary["image_total"] = media_summary.get("image_total", 0)
+            summary["image_success"] = media_summary.get("image_success", 0)
+            summary["image_failed"] = media_summary.get("image_failed", 0)
+            summary["video_total"] = media_summary.get("video_total", 0)
+            summary["video_success"] = media_summary.get("video_success", 0)
+            summary["video_failed"] = media_summary.get("video_failed", 0)
+
+            try:
+                report_paths = ReviewReportExporter.export(
+                    product=product,
+                    product_dir=product_dir,
+                    reviews=reviews,
+                )
+
+                self.log_signal.emit(
+                    f"{prefix} 评价数据 JSON 已生成：{report_paths.get('json_path')}"
+                )
+                self.log_signal.emit(
+                    f"{prefix} 评价数据 Excel 已生成：{report_paths.get('excel_path')}"
+                )
+
+            except Exception as e:
+                self.log_signal.emit(f"{prefix} 评价数据报告生成失败：{e}")
+
+            self.log_signal.emit(
+                f"{prefix} 评价图/视频采集完成：评价 {summary['review_count']} 条，"
+                f"图片成功 {summary['image_success']}/{summary['image_total']}，"
+                f"视频成功 {summary['video_success']}/{summary['video_total']}。"
+            )
+
+        except Exception as e:
+            self.log_signal.emit(f"{prefix} 评价图/视频采集失败：{e}")
+
+        return summary
+
+    def _merge_review_summary(self, total_summary: dict, item_summary: dict):
+        """
+        合并单商品评价采集统计。
+        """
+        if not item_summary:
+            return
+
+        keys = [
+            "supported_product_count",
+            "review_count",
+            "image_total",
+            "image_success",
+            "image_failed",
+            "video_total",
+            "video_success",
+            "video_failed",
+        ]
+
+        for key in keys:
+            total_summary[key] = total_summary.get(key, 0) + item_summary.get(key, 0)
+
+    
+    
     def _count_total_images(self) -> int:
         total = 0
 
