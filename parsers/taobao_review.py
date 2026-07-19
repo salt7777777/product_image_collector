@@ -1,5 +1,7 @@
 import re
 import time
+import json
+import html as html_lib
 from pathlib import Path
 
 from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
@@ -18,11 +20,16 @@ class TaobaoReviewParser:
         3. 点击“用户评价 / 累计评价 / 宝贝评价”；
         4. 滚动到评价区域；
         5. 点击“查看全部评价”；
-        6. 点击“图/视频”筛选；
+        6. 点击“图/视频 / 有图 / 晒图 / 图片 / 买家秀”筛选；
         7. 优先从网络响应中提取评价；
         8. 再从页面结构化数据中提取评价；
         9. 再从 DOM 可见评价卡片中兜底提取；
-        10. 合并去重，只保留有图/视频的评价。
+        10. 如果页面显示还有更多图/视频媒体但未采满，则尝试强化滚动；
+        11. 合并去重，只保留有图/视频的评价。
+
+    注意：
+        “图/视频5”更常见表示图/视频媒体数量约 5 个，
+        不一定表示 5 条评价。
     """
 
     def __init__(
@@ -32,7 +39,7 @@ class TaobaoReviewParser:
         login_wait_seconds: int = 180,
         timeout: int = 30000,
         log_callback=None,
-        debug: bool = True,
+        debug: bool = False,
     ):
         self.platform = platform if platform in ["taobao", "tmall"] else "taobao"
         self.user_data_dir = Path("browser_data") / self.platform
@@ -42,6 +49,9 @@ class TaobaoReviewParser:
         self.log_callback = log_callback
         self.debug = debug
 
+        # 从“图/视频5”、“图/视频 6000+”中识别出来的页面显示媒体数量。
+        self.expected_media_review_count = 0
+
     # ------------------------------------------------------------------
     # 基础
     # ------------------------------------------------------------------
@@ -49,6 +59,47 @@ class TaobaoReviewParser:
     def log(self, message: str):
         if self.log_callback:
             self.log_callback(message)
+
+    @staticmethod
+    def _is_cancelled(cancel_callback) -> bool:
+        try:
+            return bool(cancel_callback and cancel_callback())
+        except Exception:
+            return False
+
+    def _extract_count_from_text(self, text: str) -> int:
+        """
+        从“图/视频5”、“图/视频 6000+”中提取数量。
+        """
+        if not text:
+            return 0
+
+        match = re.search(r"(\d+)\s*\+?", str(text))
+        if not match:
+            return 0
+
+        try:
+            return int(match.group(1))
+        except Exception:
+            return 0
+
+    def _count_collected_media(
+        self,
+        reviews: list[ReviewItem],
+        include_video: bool = True,
+    ) -> int:
+        """
+        统计当前已采集到的评价图/视频媒体数量。
+        """
+        total = 0
+
+        for review in reviews or []:
+            total += len(review.images or [])
+
+            if include_video:
+                total += len(review.videos or [])
+
+        return total
 
     # ------------------------------------------------------------------
     # 主入口
@@ -68,215 +119,272 @@ class TaobaoReviewParser:
             return []
 
         limit = max(1, int(limit or 50))
+        self.expected_media_review_count = 0
         self.user_data_dir.mkdir(parents=True, exist_ok=True)
 
         reviews: list[ReviewItem] = []
         seen_keys = set()
 
-        with sync_playwright() as p:
-            context = p.chromium.launch_persistent_context(
-                user_data_dir=str(self.user_data_dir),
-                headless=self.headless,
-                viewport={"width": 1366, "height": 900},
-                args=[
-                    "--disable-blink-features=AutomationControlled",
-                    "--start-maximized",
-                ],
-            )
+        context = None
 
-            page = context.new_page()
-            page.set_default_timeout(self.timeout)
+        try:
+            with sync_playwright() as p:
+                context = p.chromium.launch_persistent_context(
+                    user_data_dir=str(self.user_data_dir),
+                    headless=self.headless,
+                    viewport={"width": 1366, "height": 900},
+                    args=[
+                        "--disable-blink-features=AutomationControlled",
+                        "--start-maximized",
+                    ],
+                )
 
-            # 网络接口候选评价池
-            network_reviews: list[ReviewItem] = []
-            self._bind_review_response_collector(
-                page=page,
-                reviews=network_reviews,
-                include_video=include_video,
-            )
+                page = context.new_page()
+                page.set_default_timeout(self.timeout)
 
-            try:
-                self.log("正在打开淘宝/天猫商品页，准备采集评价...")
-                page.goto(url, wait_until="domcontentloaded", timeout=self.timeout)
-            except PlaywrightTimeoutError:
-                self.log("商品页加载超时，继续尝试采集评价...")
-            except Exception as e:
-                context.close()
-                raise RuntimeError(f"打开商品页失败：{e}")
-
-            page.wait_for_timeout(2500)
-
-            # 登录检测
-            if self._is_login_page(page):
-                self.log("检测到淘宝/天猫登录页，请在浏览器中完成登录。")
-                ok = self._wait_for_login_finished(page, original_url=url)
-
-                if not ok:
-                    context.close()
-                    raise RuntimeError("登录等待超时，无法采集评价。")
-
-                self.log("登录完成，继续采集评价。")
-                page.wait_for_timeout(2500)
-
-            if cancel_callback and cancel_callback():
-                context.close()
-                return reviews
-
-            # ------------------------------------------------------------
-            # 进入完整评价列表
-            # ------------------------------------------------------------
-
-            self._try_click_review_entry(page)
-            page.wait_for_timeout(1000)
-
-            if cancel_callback and cancel_callback():
-                context.close()
-                return reviews
-
-            self._scroll_to_review_section(page)
-            page.wait_for_timeout(1000)
-
-            if cancel_callback and cancel_callback():
-                context.close()
-                return reviews
-
-            self._try_click_view_all_reviews(page)
-            page.wait_for_timeout(3000)
-
-            if cancel_callback and cancel_callback():
-                context.close()
-                return reviews
-
-            self._try_click_media_filter(page)
-            page.wait_for_timeout(3500)
-
-            if self.debug:
-                self._save_debug_page(page, "after_open_all_reviews")
-
-            # ------------------------------------------------------------
-            # 1. 合并点击过程中捕获到的网络评价
-            # ------------------------------------------------------------
-
-            self._merge_reviews(
-                target_reviews=reviews,
-                new_reviews=network_reviews,
-                seen_keys=seen_keys,
-                limit=limit,
-                source_label="网络响应初始",
-            )
-
-            if len(reviews) >= limit:
-                context.close()
-                self.log(f"淘宝/天猫评价采集完成：{len(reviews)} 条有图/视频评价。")
-                return reviews
-
-            # ------------------------------------------------------------
-            # 2. 页面结构化数据
-            # ------------------------------------------------------------
-
-            state_reviews = self._extract_reviews_from_page_state(
-                page=page,
-                include_video=include_video,
-            )
-
-            self._merge_reviews(
-                target_reviews=reviews,
-                new_reviews=state_reviews,
-                seen_keys=seen_keys,
-                limit=limit,
-                source_label="页面结构化数据",
-            )
-
-            if len(reviews) >= limit:
-                context.close()
-                self.log(f"淘宝/天猫评价采集完成：{len(reviews)} 条有图/视频评价。")
-                return reviews
-
-            # ------------------------------------------------------------
-            # 3. DOM + 网络滚动采集
-            # ------------------------------------------------------------
-
-            max_scroll_rounds = 35
-            stable_rounds = 0
-            last_count = len(reviews)
-
-            for round_index in range(max_scroll_rounds):
-                if cancel_callback and cancel_callback():
-                    break
-
-                if len(reviews) >= limit:
-                    break
-
-                # 3.1 当前 DOM 可见评价
-                dom_reviews = self._extract_reviews_from_page(
+                network_reviews: list[ReviewItem] = []
+                self._bind_review_response_collector(
                     page=page,
+                    reviews=network_reviews,
                     include_video=include_video,
                 )
 
-                before_dom = len(reviews)
+                try:
+                    self.log(
+                        f"正在打开{self.platform}商品页，准备采集图/视频评价，上限 {limit} 条..."
+                    )
+                    page.goto(url, wait_until="domcontentloaded", timeout=self.timeout)
+                except PlaywrightTimeoutError:
+                    self.log("商品页加载超时，继续尝试采集评价...")
+                except Exception as e:
+                    raise RuntimeError(f"打开商品页失败：{e}")
 
-                self._merge_reviews(
-                    target_reviews=reviews,
-                    new_reviews=dom_reviews,
-                    seen_keys=seen_keys,
-                    limit=limit,
-                    source_label="DOM",
-                    silent=True,
-                )
+                page.wait_for_timeout(2500)
 
-                dom_added = len(reviews) - before_dom
+                if self._is_login_page(page):
+                    self.log("检测到淘宝/天猫登录页，请在浏览器中完成登录。")
+                    ok = self._wait_for_login_finished(page, original_url=url)
 
-                # 3.2 合并滚动/点击期间捕获到的网络评价
-                before_network = len(reviews)
+                    if not ok:
+                        raise RuntimeError("登录等待超时，无法采集评价。")
+
+                    self.log("登录完成，继续采集评价。")
+                    page.wait_for_timeout(2500)
+
+                if self._is_cancelled(cancel_callback):
+                    return reviews
+
+                # ------------------------------------------------------------
+                # 进入完整评价列表
+                # ------------------------------------------------------------
+
+                self._try_click_review_entry(page)
+                page.wait_for_timeout(1000)
+
+                if self._is_cancelled(cancel_callback):
+                    return reviews
+
+                self._scroll_to_review_section(page)
+                page.wait_for_timeout(1000)
+
+                if self._is_cancelled(cancel_callback):
+                    return reviews
+
+                self._try_click_view_all_reviews(page)
+                page.wait_for_timeout(3000)
+
+                if self._is_cancelled(cancel_callback):
+                    return reviews
+
+                self._try_click_media_filter(page)
+                page.wait_for_timeout(3500)
+
+                if self.debug:
+                    self._save_debug_page(page, "after_open_all_reviews")
+
+                # ------------------------------------------------------------
+                # 1. 网络响应初始评价
+                # ------------------------------------------------------------
 
                 self._merge_reviews(
                     target_reviews=reviews,
                     new_reviews=network_reviews,
                     seen_keys=seen_keys,
                     limit=limit,
-                    source_label="网络响应",
-                    silent=True,
+                    source_label="网络响应初始",
                 )
-
-                network_added = len(reviews) - before_network
-
-                self.log(
-                    f"评价采集中：第 {round_index + 1}/{max_scroll_rounds} 轮，"
-                    f"DOM新增 {dom_added} 条，网络新增 {network_added} 条，累计 {len(reviews)} 条。"
-                )
-
-                if reviews and round_index == 0:
-                    self._log_review_samples(reviews)
 
                 if len(reviews) >= limit:
-                    break
+                    self.log(f"淘宝/天猫评价采集完成：{len(reviews)} 条有图/视频评价。")
+                    return reviews
 
-                if len(reviews) == last_count:
-                    stable_rounds += 1
-                else:
-                    stable_rounds = 0
+                # ------------------------------------------------------------
+                # 2. 页面结构化数据
+                # ------------------------------------------------------------
 
+                state_reviews = self._extract_reviews_from_page_state(
+                    page=page,
+                    include_video=include_video,
+                )
+
+                self._merge_reviews(
+                    target_reviews=reviews,
+                    new_reviews=state_reviews,
+                    seen_keys=seen_keys,
+                    limit=limit,
+                    source_label="页面结构化数据",
+                )
+
+                if len(reviews) >= limit:
+                    self.log(f"淘宝/天猫评价采集完成：{len(reviews)} 条有图/视频评价。")
+                    return reviews
+
+                # ------------------------------------------------------------
+                # 3. DOM + 网络滚动采集
+                # ------------------------------------------------------------
+
+                max_scroll_rounds = 35
+                stable_rounds = 0
                 last_count = len(reviews)
+                aggressive_used_count = 0
 
-                if stable_rounds >= 10:
-                    self.log("连续多轮未发现新评价，停止继续滚动。")
-                    break
+                for round_index in range(max_scroll_rounds):
+                    if self._is_cancelled(cancel_callback):
+                        break
 
-                scroll_result = self._scroll_review_area(page)
+                    if len(reviews) >= limit:
+                        break
 
-                if scroll_result:
-                    try:
-                        self.log(
-                            f"评价列表滚动：before={scroll_result.get('before')}，"
-                            f"after={scroll_result.get('after')}，"
-                            f"container={scroll_result.get('usedContainer')}"
+                    dom_reviews = self._extract_reviews_from_page(
+                        page=page,
+                        include_video=include_video,
+                    )
+
+                    before_dom = len(reviews)
+
+                    self._merge_reviews(
+                        target_reviews=reviews,
+                        new_reviews=dom_reviews,
+                        seen_keys=seen_keys,
+                        limit=limit,
+                        source_label="DOM",
+                        silent=True,
+                    )
+
+                    dom_added = len(reviews) - before_dom
+
+                    before_network = len(reviews)
+
+                    self._merge_reviews(
+                        target_reviews=reviews,
+                        new_reviews=network_reviews,
+                        seen_keys=seen_keys,
+                        limit=limit,
+                        source_label="网络响应",
+                        silent=True,
+                    )
+
+                    network_added = len(reviews) - before_network
+
+                    collected_media_count = self._count_collected_media(
+                        reviews=reviews,
+                        include_video=include_video,
+                    )
+
+                    self.log(
+                        f"评价采集中：第 {round_index + 1}/{max_scroll_rounds} 轮，"
+                        f"DOM新增 {dom_added} 条，网络新增 {network_added} 条，"
+                        f"累计评价 {len(reviews)} 条，媒体 {collected_media_count} 个。"
+                    )
+
+                    if reviews and round_index == 0:
+                        self._log_review_samples(reviews)
+
+                    if len(reviews) >= limit:
+                        break
+
+                    if len(reviews) == last_count:
+                        stable_rounds += 1
+                    else:
+                        stable_rounds = 0
+
+                    last_count = len(reviews)
+
+                    if stable_rounds >= 10:
+                        expected_count = int(self.expected_media_review_count or 0)
+                        collected_media_count = self._count_collected_media(
+                            reviews=reviews,
+                            include_video=include_video,
                         )
-                    except Exception:
-                        pass
 
-                page.wait_for_timeout(2500)
+                        # 图/视频标签上的数字通常代表媒体数量，不一定代表评价条数。
+                        if expected_count > 0 and len(reviews) >= min(expected_count, limit):
+                            self.log(
+                                f"页面显示图/视频评价约 {expected_count} 条，"
+                                f"当前已采集评价 {len(reviews)} 条，认为已采集完整。"
+                            )
+                            break
 
-            context.close()
+
+                        # 对小数量标签尝试强化滚动。
+                        # 对 6000+ 这种大数量，不尝试追满，避免无限滚动。
+                        if (
+                            expected_count > 0
+                            and expected_count <= 200
+                            and len(reviews) < min(expected_count, limit)
+                            and aggressive_used_count < 5
+                        ):
+
+                            aggressive_used_count += 1
+
+                            self.log(
+                                f"页面显示图/视频评价约 {expected_count} 条，"
+                                f"当前已采集评价 {len(reviews)} 条，"
+                                f"媒体 {collected_media_count} 个，"
+                                f"尝试第 {aggressive_used_count} 次强化滚动继续加载..."
+                            )
+
+
+                            aggressive_result = self._aggressive_scroll_review_area(page)
+
+                            if aggressive_result:
+                                try:
+                                    self.log(
+                                        f"强化滚动：before={aggressive_result.get('before')}，"
+                                        f"after={aggressive_result.get('after')}，"
+                                        f"container={aggressive_result.get('usedContainer')}"
+                                    )
+                                except Exception:
+                                    pass
+
+                            page.wait_for_timeout(3500)
+
+                            stable_rounds = 7
+                            continue
+
+                        self.log("连续多轮未发现新评价，停止继续滚动。")
+                        break
+
+                    scroll_result = self._scroll_review_area(page)
+
+                    if scroll_result:
+                        try:
+                            self.log(
+                                f"评价列表滚动：before={scroll_result.get('before')}，"
+                                f"after={scroll_result.get('after')}，"
+                                f"container={scroll_result.get('usedContainer')}"
+                            )
+                        except Exception:
+                            pass
+
+                    page.wait_for_timeout(2500)
+
+        finally:
+            if context:
+                try:
+                    context.close()
+                except Exception:
+                    pass
 
         self.log(f"淘宝/天猫评价采集完成：{len(reviews)} 条有图/视频评价。")
         return reviews
@@ -286,9 +394,6 @@ class TaobaoReviewParser:
     # ------------------------------------------------------------------
 
     def _try_click_review_entry(self, page) -> bool:
-        """
-        尝试点击评价入口。
-        """
         self.log("尝试打开评价区域...")
 
         keywords = [
@@ -330,7 +435,6 @@ class TaobaoReviewParser:
                 () => {
                     const keywords = ['用户评价', '累计评价', '宝贝评价'];
                     const nodes = Array.from(document.querySelectorAll('button, a, div, span'));
-
                     const candidates = [];
 
                     for (const node of nodes) {
@@ -340,7 +444,6 @@ class TaobaoReviewParser:
 
                         if (!text) continue;
                         if (text.length > 40) continue;
-
                         if (!keywords.some(k => text.includes(k))) continue;
 
                         const rect = node.getBoundingClientRect();
@@ -381,9 +484,6 @@ class TaobaoReviewParser:
         return False
 
     def _scroll_to_review_section(self, page) -> bool:
-        """
-        滚动到用户评价区域附近。
-        """
         self.log("尝试滚动到用户评价区域...")
 
         try:
@@ -394,7 +494,8 @@ class TaobaoReviewParser:
                         '用户评价',
                         '累计评价',
                         '宝贝评价',
-                        '查看全部评价'
+                        '查看全部评价',
+                        '全部评价'
                     ];
 
                     const nodes = Array.from(
@@ -437,9 +538,6 @@ class TaobaoReviewParser:
         return False
 
     def _try_click_view_all_reviews(self, page) -> bool:
-        """
-        点击“查看全部评价”。
-        """
         self.log("尝试点击“查看全部评价”...")
 
         keywords = [
@@ -490,7 +588,6 @@ class TaobaoReviewParser:
                     ];
 
                     const nodes = Array.from(document.querySelectorAll('button, a, div, span'));
-
                     const candidates = [];
 
                     for (const node of nodes) {
@@ -499,7 +596,6 @@ class TaobaoReviewParser:
                             .trim();
 
                         if (!text) continue;
-
                         if (!keywords.some(k => text.includes(k))) continue;
 
                         const rect = node.getBoundingClientRect();
@@ -515,9 +611,7 @@ class TaobaoReviewParser:
                         });
                     }
 
-                    if (!candidates.length) {
-                        return '';
-                    }
+                    if (!candidates.length) return '';
 
                     candidates.sort((a, b) => {
                         const lenDiff = a.text.length - b.text.length;
@@ -546,15 +640,14 @@ class TaobaoReviewParser:
         return False
 
     def _try_click_media_filter(self, page) -> bool:
-        """
-        点击“图/视频”评价筛选。
-        """
         self.log("尝试点击“图/视频”评价筛选...")
 
         keywords = [
             "图/视频",
             "有图",
             "晒图",
+            "图片",
+            "买家秀",
         ]
 
         for keyword in keywords:
@@ -578,7 +671,17 @@ class TaobaoReviewParser:
                     locator.click(timeout=2500)
                     page.wait_for_timeout(2000)
 
-                    self.log(f"已点击评价筛选：{text or keyword}")
+                    clicked_text = text or keyword
+                    count_value = self._extract_count_from_text(clicked_text)
+
+                    if count_value > 0:
+                        self.expected_media_review_count = count_value
+                        self.log(
+                             f"已点击评价筛选：{clicked_text}，页面显示图/视频评价约 {count_value} 条"
+                        )
+                    else:
+                        self.log(f"已点击评价筛选：{clicked_text}")
+
                     return True
 
             except Exception:
@@ -588,10 +691,9 @@ class TaobaoReviewParser:
             clicked = page.evaluate(
                 """
                 () => {
-                    const keywords = ['图/视频', '有图', '晒图'];
+                    const keywords = ['图/视频', '有图', '晒图', '图片', '买家秀'];
 
                     const nodes = Array.from(document.querySelectorAll('button, a, div, span'));
-
                     const candidates = [];
 
                     for (const node of nodes) {
@@ -601,7 +703,6 @@ class TaobaoReviewParser:
 
                         if (!text) continue;
                         if (text.length > 30) continue;
-
                         if (!keywords.some(k => text.includes(k))) continue;
 
                         const rect = node.getBoundingClientRect();
@@ -632,7 +733,17 @@ class TaobaoReviewParser:
 
             if clicked:
                 page.wait_for_timeout(2000)
-                self.log(f"已通过 JS 点击评价筛选：{clicked}")
+
+                count_value = self._extract_count_from_text(clicked)
+
+                if count_value > 0:
+                    self.expected_media_review_count = count_value
+                    self.log(
+                        f"已通过 JS 点击评价筛选：{clicked}，页面显示图/视频媒体约 {count_value} 个"
+                    )
+                else:
+                    self.log(f"已通过 JS 点击评价筛选：{clicked}")
+
                 return True
 
         except Exception:
@@ -643,10 +754,16 @@ class TaobaoReviewParser:
 
     def _scroll_review_area(self, page):
         """
-        滚动完整评价列表。
+        普通滚动完整评价列表。
+
+        关键点：
+            1. 先定位评价弹窗/评价列表的可滚动区域；
+            2. 将鼠标移动到该区域中心；
+            3. 使用真实 mouse.wheel 触发淘宝前端滚动监听；
+            4. 再辅助 dispatch wheel/scroll 事件。
         """
         try:
-            result = page.evaluate(
+            box = page.evaluate(
                 """
                 () => {
                     function cleanText(text) {
@@ -656,6 +773,7 @@ class TaobaoReviewParser:
                     function isVisible(el) {
                         const rect = el.getBoundingClientRect();
                         const style = window.getComputedStyle(el);
+
                         return (
                             rect.width > 0 &&
                             rect.height > 0 &&
@@ -666,6 +784,7 @@ class TaobaoReviewParser:
 
                     const keywords = [
                         '用户评价',
+                        '全部评价',
                         '图/视频',
                         '默认排序',
                         '款式筛选',
@@ -679,86 +798,175 @@ class TaobaoReviewParser:
                         .filter(el => {
                             if (!isVisible(el)) return false;
 
-                            if (el.scrollHeight <= el.clientHeight + 100) return false;
+                            const rect = el.getBoundingClientRect();
+
+                            if (rect.width < 300 || rect.height < 250) return false;
+
+                            const style = window.getComputedStyle(el);
+                            const canScroll =
+                                el.scrollHeight > el.clientHeight + 80 ||
+                                ['auto', 'scroll'].includes(style.overflowY);
+
+                            if (!canScroll) return false;
 
                             const text = cleanText(el.innerText || el.textContent || '');
                             if (!text) return false;
 
-                            const hit = keywords.some(k => text.includes(k));
-                            if (!hit) return false;
-
-                            const rect = el.getBoundingClientRect();
-
-                            if (rect.width < 300 || rect.height < 300) return false;
+                            if (!keywords.some(k => text.includes(k))) return false;
 
                             return true;
                         })
                         .map(el => {
                             const rect = el.getBoundingClientRect();
                             const text = cleanText(el.innerText || el.textContent || '');
+                            const maxScroll = Math.max(0, el.scrollHeight - el.clientHeight);
 
                             let score = 0;
-                            if (text.includes('用户评价')) score += 20;
-                            if (text.includes('图/视频')) score += 20;
-                            if (text.includes('默认排序')) score += 10;
-                            if (text.includes('已购')) score += 10;
 
-                            score += Math.min(el.scrollHeight - el.clientHeight, 3000) / 100;
+                            if (text.includes('用户评价')) score += 25;
+                            if (text.includes('全部评价')) score += 20;
+                            if (text.includes('图/视频')) score += 25;
+                            if (text.includes('默认排序')) score += 15;
+                            if (text.includes('已购')) score += 10;
+                            if (text.includes('商家回复')) score += 5;
+                            if (text.includes('追评')) score += 5;
+
+                            score += Math.min(maxScroll, 5000) / 100;
+
+                            // 优先当前视口内的弹窗内容区域
+                            if (rect.top >= 0 && rect.top < window.innerHeight) score += 20;
+                            if (rect.left >= 0 && rect.left < window.innerWidth) score += 10;
 
                             return {
-                                el,
+                                index: 0,
                                 score,
+                                text: text.slice(0, 80),
+                                left: rect.left,
                                 top: rect.top,
+                                width: rect.width,
                                 height: rect.height,
+                                centerX: rect.left + rect.width / 2,
+                                centerY: rect.top + Math.min(rect.height / 2, window.innerHeight - 80),
                                 before: el.scrollTop,
-                                maxScroll: el.scrollHeight - el.clientHeight
+                                maxScroll
                             };
                         })
                         .sort((a, b) => b.score - a.score);
 
-                    if (candidates.length > 0) {
-                        const target = candidates[0].el;
-                        const before = target.scrollTop;
-
-                        target.scrollTop = Math.min(
-                            target.scrollTop + 1200,
-                            target.scrollHeight
-                        );
-
-                        target.dispatchEvent(new WheelEvent('wheel', {
-                            deltaY: 1200,
-                            bubbles: true,
-                            cancelable: true
-                        }));
-
+                    if (!candidates.length) {
                         return {
-                            usedContainer: true,
-                            before,
-                            after: target.scrollTop,
-                            maxScroll: target.scrollHeight - target.clientHeight
+                            found: false,
+                            usedContainer: false,
+                            before: window.scrollY || document.documentElement.scrollTop || 0,
+                            after: window.scrollY || document.documentElement.scrollTop || 0,
                         };
                     }
 
-                    const beforeWindow = window.scrollY || document.documentElement.scrollTop || 0;
-                    window.scrollBy(0, 1200);
-                    const afterWindow = window.scrollY || document.documentElement.scrollTop || 0;
-
                     return {
-                        usedContainer: false,
-                        before: beforeWindow,
-                        after: afterWindow,
-                        maxScroll: document.documentElement.scrollHeight
+                        found: true,
+                        usedContainer: true,
+                        ...candidates[0]
                     };
                 }
                 """
             )
 
+            if not box or not box.get("found"):
+                before = page.evaluate("window.scrollY || document.documentElement.scrollTop || 0")
+
+                try:
+                    page.mouse.wheel(0, 1200)
+                except Exception:
+                    pass
+
+                page.wait_for_timeout(300)
+
+                after = page.evaluate("window.scrollY || document.documentElement.scrollTop || 0")
+
+                return {
+                    "usedContainer": False,
+                    "before": before,
+                    "after": after,
+                }
+
+            x = int(max(10, min(box.get("centerX", 600), 1300)))
+            y = int(max(80, min(box.get("centerY", 500), 820)))
+
+            before = box.get("before", 0)
+
             try:
-                page.mouse.wheel(0, 1200)
+                page.mouse.move(x, y)
+                page.wait_for_timeout(150)
+
+                # 真实滚轮，分多次滚，淘宝虚拟列表更容易响应
+                for _ in range(4):
+                    page.mouse.wheel(0, 420)
+                    page.wait_for_timeout(250)
+
             except Exception:
                 pass
 
-            return result
+            # 辅助触发 JS scroll/wheel
+            try:
+                after_info = page.evaluate(
+                    """
+                    () => {
+                        function cleanText(text) {
+                            return (text || '').replace(/\\s+/g, ' ').trim();
+                        }
+
+                        const keywords = ['用户评价', '全部评价', '图/视频', '默认排序', '已购'];
+
+                        const candidates = Array.from(document.querySelectorAll('*'))
+                            .filter(el => {
+                                const rect = el.getBoundingClientRect();
+                                if (rect.width < 300 || rect.height < 250) return false;
+                                if (el.scrollHeight <= el.clientHeight + 80) return false;
+
+                                const text = cleanText(el.innerText || el.textContent || '');
+                                return text && keywords.some(k => text.includes(k));
+                            })
+                            .sort((a, b) => {
+                                const aMax = a.scrollHeight - a.clientHeight;
+                                const bMax = b.scrollHeight - b.clientHeight;
+                                return bMax - aMax;
+                            });
+
+                        if (!candidates.length) {
+                            return {
+                                after: window.scrollY || document.documentElement.scrollTop || 0,
+                                maxScroll: document.documentElement.scrollHeight
+                            };
+                        }
+
+                        const el = candidates[0];
+
+                        el.dispatchEvent(new WheelEvent('wheel', {
+                            deltaY: 1200,
+                            bubbles: true,
+                            cancelable: true
+                        }));
+
+                        el.dispatchEvent(new Event('scroll', { bubbles: true }));
+
+                        return {
+                            after: el.scrollTop,
+                            maxScroll: el.scrollHeight - el.clientHeight
+                        };
+                    }
+                    """
+                )
+            except Exception:
+                after_info = {}
+
+            return {
+                "usedContainer": True,
+                "before": before,
+                "after": after_info.get("after", before),
+                "maxScroll": after_info.get("maxScroll", box.get("maxScroll")),
+                "mouseX": x,
+                "mouseY": y,
+            }
 
         except Exception:
             try:
@@ -767,6 +975,228 @@ class TaobaoReviewParser:
                 pass
 
         return None
+
+
+    def _aggressive_scroll_review_area(self, page):
+        """
+        强化滚动评价列表。
+
+        用于页面显示还有更多图/视频评价，但普通滚动后 DOM 一直不变化的情况。
+        """
+        try:
+            box = page.evaluate(
+                """
+                () => {
+                    function cleanText(text) {
+                        return (text || '').replace(/\\s+/g, ' ').trim();
+                    }
+
+                    function isVisible(el) {
+                        const rect = el.getBoundingClientRect();
+                        const style = window.getComputedStyle(el);
+
+                        return (
+                            rect.width > 0 &&
+                            rect.height > 0 &&
+                            style.display !== 'none' &&
+                            style.visibility !== 'hidden'
+                        );
+                    }
+
+                    const keywords = [
+                        '用户评价',
+                        '全部评价',
+                        '图/视频',
+                        '默认排序',
+                        '款式筛选',
+                        '已购',
+                        '追评',
+                        '商家回复'
+                    ];
+
+                    const candidates = Array.from(document.querySelectorAll('*'))
+                        .filter(el => {
+                            if (!isVisible(el)) return false;
+
+                            const rect = el.getBoundingClientRect();
+
+                            if (rect.width < 300 || rect.height < 250) return false;
+
+                            const style = window.getComputedStyle(el);
+                            const canScroll =
+                                el.scrollHeight > el.clientHeight + 80 ||
+                                ['auto', 'scroll'].includes(style.overflowY);
+
+                            if (!canScroll) return false;
+
+                            const text = cleanText(el.innerText || el.textContent || '');
+                            if (!text) return false;
+
+                            if (!keywords.some(k => text.includes(k))) return false;
+
+                            return true;
+                        })
+                        .map(el => {
+                            const rect = el.getBoundingClientRect();
+                            const text = cleanText(el.innerText || el.textContent || '');
+                            const maxScroll = Math.max(0, el.scrollHeight - el.clientHeight);
+
+                            let score = 0;
+
+                            if (text.includes('用户评价')) score += 25;
+                            if (text.includes('全部评价')) score += 20;
+                            if (text.includes('图/视频')) score += 25;
+                            if (text.includes('默认排序')) score += 15;
+                            if (text.includes('已购')) score += 10;
+
+                            score += Math.min(maxScroll, 8000) / 100;
+
+                            if (rect.top >= 0 && rect.top < window.innerHeight) score += 20;
+
+                            return {
+                                score,
+                                text: text.slice(0, 80),
+                                left: rect.left,
+                                top: rect.top,
+                                width: rect.width,
+                                height: rect.height,
+                                centerX: rect.left + rect.width / 2,
+                                centerY: rect.top + Math.min(rect.height / 2, window.innerHeight - 80),
+                                before: el.scrollTop,
+                                maxScroll
+                            };
+                        })
+                        .sort((a, b) => b.score - a.score);
+
+                    if (!candidates.length) {
+                        return {
+                            found: false,
+                            usedContainer: false,
+                            before: window.scrollY || document.documentElement.scrollTop || 0,
+                            after: window.scrollY || document.documentElement.scrollTop || 0,
+                        };
+                    }
+
+                    return {
+                        found: true,
+                        usedContainer: true,
+                        ...candidates[0]
+                    };
+                }
+                """
+            )
+
+            if not box or not box.get("found"):
+                before = page.evaluate("window.scrollY || document.documentElement.scrollTop || 0")
+
+                try:
+                    for _ in range(6):
+                        page.mouse.wheel(0, 650)
+                        page.wait_for_timeout(250)
+                except Exception:
+                    pass
+
+                after = page.evaluate("window.scrollY || document.documentElement.scrollTop || 0")
+
+                return {
+                    "usedContainer": False,
+                    "before": before,
+                    "after": after,
+                }
+
+            x = int(max(10, min(box.get("centerX", 600), 1300)))
+            y = int(max(80, min(box.get("centerY", 500), 820)))
+
+            before = box.get("before", 0)
+
+            try:
+                page.mouse.move(x, y)
+                page.wait_for_timeout(200)
+
+                # 强化滚轮，多段滚动，模拟人工滚动
+                for _ in range(8):
+                    page.mouse.wheel(0, 650)
+                    page.wait_for_timeout(300)
+
+                # 键盘辅助
+                page.keyboard.press("PageDown")
+                page.wait_for_timeout(500)
+                page.keyboard.press("PageDown")
+
+            except Exception:
+                pass
+
+            try:
+                after_info = page.evaluate(
+                    """
+                    () => {
+                        function cleanText(text) {
+                            return (text || '').replace(/\\s+/g, ' ').trim();
+                        }
+
+                        const keywords = ['用户评价', '全部评价', '图/视频', '默认排序', '已购'];
+
+                        const candidates = Array.from(document.querySelectorAll('*'))
+                            .filter(el => {
+                                const rect = el.getBoundingClientRect();
+                                if (rect.width < 300 || rect.height < 250) return false;
+                                if (el.scrollHeight <= el.clientHeight + 80) return false;
+
+                                const text = cleanText(el.innerText || el.textContent || '');
+                                return text && keywords.some(k => text.includes(k));
+                            })
+                            .sort((a, b) => {
+                                const aMax = a.scrollHeight - a.clientHeight;
+                                const bMax = b.scrollHeight - b.clientHeight;
+                                return bMax - aMax;
+                            });
+
+                        if (!candidates.length) {
+                            return {
+                                after: window.scrollY || document.documentElement.scrollTop || 0,
+                                maxScroll: document.documentElement.scrollHeight
+                            };
+                        }
+
+                        const el = candidates[0];
+
+                        el.dispatchEvent(new WheelEvent('wheel', {
+                            deltaY: 2600,
+                            bubbles: true,
+                            cancelable: true
+                        }));
+
+                        el.dispatchEvent(new Event('scroll', { bubbles: true }));
+
+                        return {
+                            after: el.scrollTop,
+                            maxScroll: el.scrollHeight - el.clientHeight
+                        };
+                    }
+                    """
+                )
+            except Exception:
+                after_info = {}
+
+            return {
+                "usedContainer": True,
+                "before": before,
+                "after": after_info.get("after", before),
+                "maxScroll": after_info.get("maxScroll", box.get("maxScroll")),
+                "mouseX": x,
+                "mouseY": y,
+            }
+
+        except Exception:
+            try:
+                for _ in range(6):
+                    page.mouse.wheel(0, 650)
+                    page.wait_for_timeout(250)
+            except Exception:
+                pass
+
+        return None
+
 
     # ------------------------------------------------------------------
     # 合并去重
@@ -818,10 +1248,6 @@ class TaobaoReviewParser:
         reviews: list[ReviewItem],
         include_video: bool = True,
     ):
-        """
-        捕获淘宝/天猫评价接口响应。
-        """
-
         def handle_response(response):
             try:
                 response_url = response.url or ""
@@ -853,6 +1279,9 @@ class TaobaoReviewParser:
 
                 if not text:
                     return
+
+                if len(text) > 2_000_000:
+                    text = text[:2_000_000]
 
                 parsed_reviews = self._extract_reviews_from_response_text(
                     text=text,
@@ -961,16 +1390,12 @@ class TaobaoReviewParser:
         return reviews
 
     def _try_parse_json_like_text(self, text: str):
-        import json
-        import html as html_lib
-
         if not text:
             return None
 
         text = text.strip()
         text = html_lib.unescape(text)
 
-        # JSONP: callback({...})
         jsonp_match = re.search(r"^[\w.$]+\((.*)\)\s*;?$", text, flags=re.S)
         if jsonp_match:
             text = jsonp_match.group(1).strip()
@@ -980,7 +1405,6 @@ class TaobaoReviewParser:
         except Exception:
             pass
 
-        # 截取第一个 JSON 对象
         first = text.find("{")
         last = text.rfind("}")
 
@@ -1000,7 +1424,6 @@ class TaobaoReviewParser:
 
         result = []
 
-        # 有些 mtop 的 data 里面会把 JSON 放成字符串
         if isinstance(data, str):
             parsed = self._try_parse_json_like_text(data)
             if parsed is not None and parsed is not data:
@@ -1055,6 +1478,10 @@ class TaobaoReviewParser:
             "rateContent",
             "reviewContent",
             "commentContent",
+            "feedbackContent",
+            "commentText",
+            "contentText",
+            "reviewText",
         ]
 
         user_keys = [
@@ -1063,16 +1490,26 @@ class TaobaoReviewParser:
             "nickName",
             "displayUserNick",
             "userNick",
+            "buyerNick",
+            "userDisplayName",
+            "displayName",
         ]
 
         media_keys = [
             "media",
+            "mediaList",
             "images",
             "imageList",
             "pics",
             "photos",
+            "picList",
+            "picUrls",
+            "appendPics",
+            "appendImages",
             "videos",
             "videoList",
+            "appendVideos",
+            "videoInfoList",
         ]
 
         has_text = any(item.get(k) for k in text_keys)
@@ -1083,6 +1520,8 @@ class TaobaoReviewParser:
             or item.get("sku")
             or item.get("auctionSku")
             or item.get("skuText")
+            or item.get("skuDesc")
+            or item.get("auctionSkuText")
         )
 
         return has_media and (has_text or has_user or has_sku)
@@ -1102,6 +1541,9 @@ class TaobaoReviewParser:
             or raw.get("nickName")
             or raw.get("displayUserNick")
             or raw.get("userNick")
+            or raw.get("buyerNick")
+            or raw.get("userDisplayName")
+            or raw.get("displayName")
             or ""
         )
 
@@ -1112,6 +1554,10 @@ class TaobaoReviewParser:
             or raw.get("rateContent")
             or raw.get("reviewContent")
             or raw.get("commentContent")
+            or raw.get("feedbackContent")
+            or raw.get("commentText")
+            or raw.get("contentText")
+            or raw.get("reviewText")
             or ""
         )
 
@@ -1121,6 +1567,10 @@ class TaobaoReviewParser:
             or raw.get("creationTime")
             or raw.get("rateDate")
             or raw.get("gmtCreate")
+            or raw.get("feedbackDate")
+            or raw.get("commentTime")
+            or raw.get("date")
+            or raw.get("time")
             or ""
         )
 
@@ -1131,6 +1581,8 @@ class TaobaoReviewParser:
             or raw.get("sku")
             or raw.get("auctionSku")
             or raw.get("skuText")
+            or raw.get("skuDesc")
+            or raw.get("auctionSkuText")
             or ""
         )
 
@@ -1191,8 +1643,7 @@ class TaobaoReviewParser:
             if u:
                 videos.append(str(u))
 
-        # 1. media 数组
-        media = raw.get("media")
+        media = raw.get("media") or raw.get("mediaList")
 
         if isinstance(media, list):
             for m in media:
@@ -1207,6 +1658,7 @@ class TaobaoReviewParser:
                     or m.get("thumbnail")
                     or m.get("coverUrl")
                     or m.get("cover")
+                    or m.get("poster")
                     or ""
                 )
 
@@ -1215,6 +1667,10 @@ class TaobaoReviewParser:
                     or m.get("videoURL")
                     or m.get("video")
                     or m.get("videoPath")
+                    or m.get("playUrl")
+                    or m.get("playURL")
+                    or m.get("mp4Url")
+                    or m.get("videoSrc")
                     or m.get("url")
                     or ""
                 )
@@ -1223,13 +1679,20 @@ class TaobaoReviewParser:
                     if include_video:
                         add_video(video_url)
 
-                    # 视频封面也作为图片保留
                     add_image(image_url)
                 else:
                     add_image(image_url or m.get("url"))
 
-        # 2. images / imageList / pics / photos
-        for key in ["images", "imageList", "pics", "photos"]:
+        for key in [
+            "images",
+            "imageList",
+            "pics",
+            "photos",
+            "picList",
+            "picUrls",
+            "appendPics",
+            "appendImages",
+        ]:
             value = raw.get(key)
 
             if isinstance(value, list):
@@ -1242,11 +1705,24 @@ class TaobaoReviewParser:
                             or item.get("url")
                             or item.get("picUrl")
                             or item.get("src")
+                            or item.get("thumbnail")
+                            or item.get("coverUrl")
+                            or item.get("cover")
+                            or item.get("originUrl")
+                            or item.get("originalUrl")
                         )
 
-        # 3. videos / videoList
+            elif isinstance(value, str):
+                for u in self._split_possible_url_string(value):
+                    add_image(u)
+
         if include_video:
-            for key in ["videos", "videoList"]:
+            for key in [
+                "videos",
+                "videoList",
+                "appendVideos",
+                "videoInfoList",
+            ]:
                 value = raw.get(key)
 
                 if isinstance(value, list):
@@ -1256,15 +1732,73 @@ class TaobaoReviewParser:
                         elif isinstance(item, dict):
                             add_video(
                                 item.get("videoUrl")
+                                or item.get("videoURL")
                                 or item.get("url")
                                 or item.get("src")
                                 or item.get("video")
+                                or item.get("videoPath")
+                                or item.get("playUrl")
+                                or item.get("playURL")
+                                or item.get("mp4Url")
+                                or item.get("videoSrc")
                             )
+
+                            add_image(
+                                item.get("coverUrl")
+                                or item.get("cover")
+                                or item.get("poster")
+                                or item.get("imageUrl")
+                                or item.get("thumbnail")
+                            )
+
+                elif isinstance(value, str):
+                    for u in self._split_possible_url_string(value):
+                        add_video(u)
 
         return dedupe_urls(images), dedupe_urls(videos)
 
+    def _split_possible_url_string(self, value: str) -> list[str]:
+        value = str(value or "").strip()
+
+        if not value:
+            return []
+
+        result = []
+
+        for part in re.split(r"[,，\s]+", value):
+            part = part.strip().strip("'\"")
+
+            if not part:
+                continue
+
+            lower = part.lower()
+
+            if (
+                part.startswith("http")
+                or part.startswith("//")
+                or ".jpg" in lower
+                or ".jpeg" in lower
+                or ".png" in lower
+                or ".webp" in lower
+                or ".gif" in lower
+                or ".avif" in lower
+                or ".mp4" in lower
+                or ".m3u8" in lower
+            ):
+                result.append(part)
+
+        return result
+
     def _extract_like_count_from_raw_item(self, raw: dict) -> int:
-        for key in ["likeCount", "usefulCount", "helpfulCount", "likedCount"]:
+        for key in [
+            "likeCount",
+            "usefulCount",
+            "helpfulCount",
+            "likedCount",
+            "upCount",
+            "praiseCount",
+            "agreeCount",
+        ]:
             value = raw.get(key)
 
             if value is None:
@@ -1324,7 +1858,7 @@ class TaobaoReviewParser:
                             Array.isArray(obj.group.items) &&
                             (
                                 obj.totalCount !== undefined ||
-                                obj.items.some(x => x && x.media && x.content)
+                                obj.group.items.some(x => x && (x.media || x.images || x.pics) && (x.content || x.feedback))
                             )
                         ) {
                             return obj.group.items;
@@ -1332,7 +1866,7 @@ class TaobaoReviewParser:
 
                         if (
                             Array.isArray(obj.items) &&
-                            obj.items.some(x => x && x.media && x.content)
+                            obj.items.some(x => x && (x.media || x.images || x.pics) && (x.content || x.feedback))
                         ) {
                             return obj.items;
                         }
@@ -1351,7 +1885,9 @@ class TaobaoReviewParser:
                                 key === 'res' ||
                                 key === 'home' ||
                                 key === 'group' ||
-                                key === 'items'
+                                key === 'items' ||
+                                key === 'rateData' ||
+                                key === 'reviewData'
                             ) {
                                 result = result.concat(findRateItems(value, depth + 1));
                             }
@@ -1360,23 +1896,75 @@ class TaobaoReviewParser:
                         return result;
                     }
 
+                    function addImageFromValue(value, images) {
+                        if (!value) return;
+
+                        if (typeof value === 'string') {
+                            images.push(normalizeUrl(value));
+                            return;
+                        }
+
+                        if (typeof value === 'object') {
+                            const u = normalizeUrl(
+                                value.imageUrl ||
+                                value.url ||
+                                value.picUrl ||
+                                value.src ||
+                                value.thumbnail ||
+                                value.coverUrl ||
+                                value.cover ||
+                                value.originUrl ||
+                                value.originalUrl ||
+                                ''
+                            );
+
+                            if (u) images.push(u);
+                        }
+                    }
+
+                    function addVideoFromValue(value, videos, images) {
+                        if (!value) return;
+
+                        if (typeof value === 'string') {
+                            videos.push(normalizeUrl(value));
+                            return;
+                        }
+
+                        if (typeof value === 'object') {
+                            const videoUrl = normalizeUrl(
+                                value.videoUrl ||
+                                value.videoURL ||
+                                value.url ||
+                                value.src ||
+                                value.video ||
+                                value.videoPath ||
+                                value.playUrl ||
+                                value.playURL ||
+                                value.mp4Url ||
+                                value.videoSrc ||
+                                ''
+                            );
+
+                            const coverUrl = normalizeUrl(
+                                value.coverUrl ||
+                                value.cover ||
+                                value.poster ||
+                                value.imageUrl ||
+                                value.thumbnail ||
+                                ''
+                            );
+
+                            if (videoUrl) videos.push(videoUrl);
+                            if (coverUrl) images.push(coverUrl);
+                        }
+                    }
+
                     const roots = [];
 
-                    try {
-                        if (window.__ICE_APP_CONTEXT__) roots.push(window.__ICE_APP_CONTEXT__);
-                    } catch (e) {}
-
-                    try {
-                        if (window.__INITIAL_STATE__) roots.push(window.__INITIAL_STATE__);
-                    } catch (e) {}
-
-                    try {
-                        if (window.__INIT_DATA__) roots.push(window.__INIT_DATA__);
-                    } catch (e) {}
-
-                    try {
-                        if (window.__APOLLO_STATE__) roots.push(window.__APOLLO_STATE__);
-                    } catch (e) {}
+                    try { if (window.__ICE_APP_CONTEXT__) roots.push(window.__ICE_APP_CONTEXT__); } catch (e) {}
+                    try { if (window.__INITIAL_STATE__) roots.push(window.__INITIAL_STATE__); } catch (e) {}
+                    try { if (window.__INIT_DATA__) roots.push(window.__INIT_DATA__); } catch (e) {}
+                    try { if (window.__APOLLO_STATE__) roots.push(window.__APOLLO_STATE__); } catch (e) {}
 
                     let items = [];
 
@@ -1389,10 +1977,11 @@ class TaobaoReviewParser:
                     for (const item of items) {
                         if (!item || typeof item !== 'object') continue;
 
-                        const media = Array.isArray(item.media) ? item.media : [];
-
                         const images = [];
                         const videos = [];
+
+                        const media = Array.isArray(item.media) ? item.media :
+                                      Array.isArray(item.mediaList) ? item.mediaList : [];
 
                         for (const m of media) {
                             if (!m || typeof m !== 'object') continue;
@@ -1404,6 +1993,8 @@ class TaobaoReviewParser:
                                 m.picUrl ||
                                 m.thumbnail ||
                                 m.coverUrl ||
+                                m.cover ||
+                                m.poster ||
                                 ''
                             );
 
@@ -1412,21 +2003,40 @@ class TaobaoReviewParser:
                                 m.videoURL ||
                                 m.video ||
                                 m.videoPath ||
+                                m.playUrl ||
+                                m.playURL ||
+                                m.mp4Url ||
+                                m.videoSrc ||
                                 m.url ||
                                 ''
                             );
 
                             if (type === 'video') {
-                                if (includeVideo && videoUrl) {
-                                    videos.push(videoUrl);
-                                }
-
-                                if (imageUrl) {
-                                    images.push(imageUrl);
-                                }
+                                if (includeVideo && videoUrl) videos.push(videoUrl);
+                                if (imageUrl) images.push(imageUrl);
                             } else {
-                                if (imageUrl) {
-                                    images.push(imageUrl);
+                                if (imageUrl) images.push(imageUrl);
+                            }
+                        }
+
+                        for (const key of ['images', 'imageList', 'pics', 'photos', 'picList', 'picUrls', 'appendPics', 'appendImages']) {
+                            const value = item[key];
+
+                            if (Array.isArray(value)) {
+                                for (const v of value) addImageFromValue(v, images);
+                            } else {
+                                addImageFromValue(value, images);
+                            }
+                        }
+
+                        if (includeVideo) {
+                            for (const key of ['videos', 'videoList', 'appendVideos', 'videoInfoList']) {
+                                const value = item[key];
+
+                                if (Array.isArray(value)) {
+                                    for (const v of value) addVideoFromValue(v, videos, images);
+                                } else {
+                                    addVideoFromValue(value, videos, images);
                                 }
                             }
                         }
@@ -1435,13 +2045,42 @@ class TaobaoReviewParser:
 
                         result.push({
                             feedId: item.feedId || item.id || '',
-                            userName: item.userName || item.nick || '',
-                            content: item.content || item.feedback || '',
-                            dateTime: item.dateTime || item.createTime || item.creationTime || '',
-                            skuInfo: item.skuInfo || item.sku || '',
+                            userName:
+                                item.userName ||
+                                item.nick ||
+                                item.nickName ||
+                                item.userNick ||
+                                item.displayUserNick ||
+                                item.buyerNick ||
+                                '',
+                            content:
+                                item.content ||
+                                item.feedback ||
+                                item.comment ||
+                                item.rateContent ||
+                                item.reviewContent ||
+                                item.commentContent ||
+                                '',
+                            dateTime:
+                                item.dateTime ||
+                                item.createTime ||
+                                item.creationTime ||
+                                item.rateDate ||
+                                item.gmtCreate ||
+                                item.commentTime ||
+                                item.date ||
+                                item.time ||
+                                '',
+                            skuInfo:
+                                item.skuInfo ||
+                                item.sku ||
+                                item.auctionSku ||
+                                item.skuText ||
+                                item.skuDesc ||
+                                '',
                             mediaSize: item.mediaSize || '',
-                            images,
-                            videos
+                            images: Array.from(new Set(images)),
+                            videos: Array.from(new Set(videos))
                         });
                     }
 
@@ -1619,9 +2258,18 @@ class TaobaoReviewParser:
 
                         const hasDate =
                             /\\d{4}年\\d{1,2}月\\d{1,2}日/.test(text) ||
-                            /\\d{4}-\\d{1,2}-\\d{1,2}/.test(text);
+                            /\\d{4}-\\d{1,2}-\\d{1,2}/.test(text) ||
+                            /\\d{4}\\.\\d{1,2}\\.\\d{1,2}/.test(text) ||
+                            /\\d{1,2}月\\d{1,2}日/.test(text) ||
+                            /\\d{1,2}\\.\\d{1,2}/.test(text) ||
+                            text.includes('今天') ||
+                            text.includes('昨天');
 
-                        const hasBought = text.includes('已购');
+                        const hasBought =
+                            text.includes('已购') ||
+                            text.includes('规格') ||
+                            text.includes('颜色') ||
+                            text.includes('尺码');
 
                         return hasDate || hasBought;
                     }
@@ -1720,7 +2368,6 @@ class TaobaoReviewParser:
                         if (!includeVideo) return [];
 
                         const urls = [];
-
                         const videos = Array.from(card.querySelectorAll('video'));
 
                         for (const video of videos) {
@@ -1751,7 +2398,10 @@ class TaobaoReviewParser:
                                 'data-video-url',
                                 'data-url',
                                 'data-src',
-                                'data-mp4'
+                                'data-mp4',
+                                'data-play-url',
+                                'data-playurl',
+                                'data-video-src'
                             ]) {
                                 const u = node.getAttribute(attr);
 
@@ -1778,6 +2428,8 @@ class TaobaoReviewParser:
                                 text.includes('用户评价') ||
                                 text.includes('宝贝评价') ||
                                 text.includes('累计评价') ||
+                                text.includes('全部评价') ||
+                                text.includes('查看全部评价') ||
                                 text.includes('图/视频') ||
                                 text.includes('默认排序') ||
                                 text.includes('款式筛选') ||
@@ -1798,6 +2450,7 @@ class TaobaoReviewParser:
                                 el,
                                 score:
                                     (text.includes('用户评价') ? 20 : 0) +
+                                    (text.includes('全部评价') ? 15 : 0) +
                                     (text.includes('图/视频') ? 20 : 0) +
                                     (text.includes('默认排序') ? 10 : 0) +
                                     (text.includes('款式筛选') ? 10 : 0) +
@@ -1825,6 +2478,7 @@ class TaobaoReviewParser:
 
                             if (rect.width < 220 || rect.height < 90) continue;
                             if (rect.height > 950) continue;
+
                             if (!hasReviewSemantic(text)) continue;
 
                             const images = collectImages(node);
@@ -2061,6 +2715,17 @@ class TaobaoReviewParser:
     # 文本解析
     # ------------------------------------------------------------------
 
+    def _date_pattern(self):
+        return re.compile(
+            r"\d{4}年\d{1,2}月\d{1,2}日"
+            r"|\d{4}-\d{1,2}-\d{1,2}"
+            r"|\d{4}\.\d{1,2}\.\d{1,2}"
+            r"|\d{1,2}月\d{1,2}日"
+            r"|\d{1,2}\.\d{1,2}"
+            r"|今天"
+            r"|昨天"
+        )
+
     def _extract_review_fields_from_lines(self, lines: list[str], full_text: str = "") -> dict:
         cleaned_lines = []
 
@@ -2100,9 +2765,7 @@ class TaobaoReviewParser:
         content_parts = []
         like_count = 0
 
-        date_pattern = re.compile(
-            r"\d{4}年\d{1,2}月\d{1,2}日|\d{4}-\d{1,2}-\d{1,2}"
-        )
+        date_pattern = self._date_pattern()
 
         for line in cleaned_lines:
             m = date_pattern.search(line)
@@ -2115,7 +2778,7 @@ class TaobaoReviewParser:
                 if date in line:
                     before = line.split(date)[0].strip()
                     before = re.sub(
-                        r"(88VIP|VIP|V\d+|蓝钻|红钻|黄钻)$",
+                        r"(88VIP|VIP|V\d+|蓝钻|红钻|黄钻|超级会员|天猫会员)$",
                         "",
                         before,
                         flags=re.I,
@@ -2176,7 +2839,7 @@ class TaobaoReviewParser:
                 line = line[len(user_name):].strip()
 
             line = re.sub(
-                r"^(88VIP|VIP|V\d+|蓝钻|红钻|黄钻)\s*",
+                r"^(88VIP|VIP|V\d+|蓝钻|红钻|黄钻|超级会员|天猫会员)\s*",
                 "",
                 line,
                 flags=re.I,
@@ -2226,8 +2889,7 @@ class TaobaoReviewParser:
 
         content = text
 
-        content = re.sub(r"\d{4}年\d{1,2}月\d{1,2}日", " ", content)
-        content = re.sub(r"\d{4}-\d{1,2}-\d{1,2}", " ", content)
+        content = self._date_pattern().sub(" ", content)
         content = re.sub(r"已购[:：]?\s*[^。；;\n]+", " ", content)
         content = re.sub(r"规格[:：]?\s*[^。；;\n]+", " ", content)
 
@@ -2256,6 +2918,14 @@ class TaobaoReviewParser:
 
         if re.match(r"^\d{4}-\d{1,2}-\d{1,2}$", date):
             parts = date.split("-")
+
+            try:
+                return f"{int(parts[0])}年{int(parts[1])}月{int(parts[2])}日"
+            except Exception:
+                return date
+
+        if re.match(r"^\d{4}\.\d{1,2}\.\d{1,2}$", date):
+            parts = date.split(".")
 
             try:
                 return f"{int(parts[0])}年{int(parts[1])}月{int(parts[2])}日"
